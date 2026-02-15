@@ -446,6 +446,12 @@ def main():
                 """,
                 unsafe_allow_html=True
             )
+
+        # [JOKE BUTTON]
+        st.markdown("---")
+        if st.button(" อย่ากดตรงนี้นะไอสัส", type="secondary", use_container_width=True):
+            st.toast("กุบอกแล้ว! 💥", icon="😡")
+            st.audio("https://www.myinstants.com/media/sounds/khraang-250.mp3", format="audio/mp3", autoplay=True)
         
     st.markdown("---")
 
