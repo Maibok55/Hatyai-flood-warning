@@ -6,3 +6,4 @@ openmeteo-requests
 requests-cache
 retry_requests
 numpy
+scikit-learn
