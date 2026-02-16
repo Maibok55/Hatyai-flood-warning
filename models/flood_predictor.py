@@ -722,7 +722,7 @@ class FloodPredictor:
         if df.empty:
             return []
             
-        df_sadao = df[df['station_id'] == 'Sadao'].set_index('timestamp').resample('1h').mean().interpolate()
+        df_sadao = df[df['station_id'] == 'Sadao'].set_index('timestamp')[['level']].resample('1h').mean().interpolate()
         
         for h in range(1, hours + 1):
             future_time = current_time + timedelta(hours=h)
