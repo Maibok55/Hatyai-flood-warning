@@ -5,12 +5,19 @@ import requests
 from datetime import datetime, timedelta
 from sklearn.linear_model import LinearRegression
 import functools
+import pytz
+from constants import (
+    STATION_METADATA, RIVER_HYDRAULICS, RAINFALL_THRESHOLDS,
+    HISTORICAL_EVENTS, RISK_CALCULATION, API_CONFIG,
+    SYSTEM_CONFIG, calculate_flow_velocity, sigmoid_risk,
+    calculate_eta_hours, calculate_actual_distance
+)
 
 # =============================================================
 # UTILITY: Error Shielding Decorator
 # =============================================================
 def safe_value(func):
-    """Decorator that sanitizes sensor values. Kills -9.99 ghosts."""
+    """Decorator that sanitizes sensor values using station-specific thresholds."""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         result = func(*args, **kwargs)
@@ -18,37 +25,64 @@ def safe_value(func):
             for key in ['level', 'value']:
                 if key in result and result[key] is not None:
                     try:
-                        if float(result[key]) <= -5.0:
+                        val = float(result[key])
+                        # Use station-specific validation
+                        station_id = result.get('station_id', 'Unknown')
+                        min_threshold = STATION_METADATA.get(station_id, {}).get('min_valid_level', -5.0)
+                        if val <= min_threshold:
                             result[key] = None
                     except (ValueError, TypeError):
                         result[key] = None
         return result
     return wrapper
 
-def clean_value(val):
-    """Inline sanitizer for any sensor reading."""
+def clean_value(val, station_id=None):
+    """Inline sanitizer for any sensor reading with station-specific logic."""
     if val is None:
         return None
     try:
         v = float(val)
-        return v if v > -5.0 else None
+        # Use station-specific minimum threshold
+        min_threshold = STATION_METADATA.get(station_id, {}).get('min_valid_level', -5.0)
+        return v if v > min_threshold else None
     except (ValueError, TypeError):
         return None
 
+def get_bangkok_time():
+    """Get current time in Asia/Bangkok timezone."""
+    bangkok_tz = pytz.timezone(SYSTEM_CONFIG['timezone'])
+    return datetime.now(bangkok_tz)
+
+def parse_timestamp(ts_str, assume_timezone=None):
+    """Parse timestamp string with timezone awareness."""
+    if not ts_str:
+        return get_bangkok_time()
+    
+    bangkok_tz = pytz.timezone(SYSTEM_CONFIG['timezone'])
+    
+    # Try different formats
+    formats = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%dT%H:%M:%S']
+    
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(ts_str.strip(), fmt)
+            if assume_timezone:
+                dt = pytz.timezone(assume_timezone).localize(dt)
+            elif dt.tzinfo is None:
+                dt = bangkok_tz.localize(dt)
+            return dt
+        except ValueError:
+            continue
+    
+    # Fallback to current time
+    return get_bangkok_time()
+
 # =============================================================
-# CONSTANTS
+# CONSTANTS (Legacy - kept for compatibility)
 # =============================================================
-# Distance from Sadao (X.173) to Hat Yai (X.90) via U-Tapao Canal
-SADAO_TO_HATYAI_KM = 60.0
-# Base flow velocity in m/s (adjustable)
-BASE_VELOCITY_MS = 0.8
-# Historical flood events for comparison (3-day rain mm)
-HISTORICAL_EVENTS = {
-    2010: {"rain_mm": 500, "label": "2010 Great Flood", "severity": "CATASTROPHIC"},
-    2012: {"rain_mm": 350, "label": "2012 Severe Flood", "severity": "SEVERE"},
-    2017: {"rain_mm": 200, "label": "2017 Moderate Flood", "severity": "MODERATE"},
-    2022: {"rain_mm": 250, "label": "2022 Flash Flood", "severity": "MODERATE"},
-}
+# These are now imported from constants.py for better organization
+SADAO_TO_HATYAI_KM = RIVER_HYDRAULICS['straight_distance_km']
+BASE_VELOCITY_MS = RIVER_HYDRAULICS['base_velocity_normal']
 
 
 class FloodPredictor:
@@ -76,23 +110,29 @@ class FloodPredictor:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS water_levels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                station_id TEXT,
+                timestamp TEXT NOT NULL,
+                station_id TEXT NOT NULL,
                 level REAL,
+                created_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
                 UNIQUE(timestamp, station_id)
             )
         """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS risk_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')),
+                timestamp TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
                 rain_forecast_3d REAL,
                 sensor_level REAL,
                 risk_score REAL,
                 alert_level TEXT,
-                data_source TEXT
+                data_source TEXT,
+                created_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now'))
             )
         """)
+        # Add indexes for better performance
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_water_levels_timestamp ON water_levels(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_water_levels_station ON water_levels(station_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_risk_logs_timestamp ON risk_logs(timestamp)")
         conn.commit()
         conn.close()
 
@@ -101,20 +141,16 @@ class FloodPredictor:
     # =========================================================
     def fetch_and_store_data(self):
         """
-        Fetch water levels.
-        Smart Cache: Checks DB first. If data < 15 mins old, returns DB data (0ms).
-        Otherwise fetches from ThaiWater API (timeout 5s).
+        Fetch water levels with atomic operations and proper timezone handling.
+        Smart Cache: Checks DB first. If data < cache minutes old, returns DB data.
+        Otherwise fetches from ThaiWater API with timeout.
         """
-        api_url = "https://api-v3.thaiwater.net/api/v1/thaiwater30/public/waterlevel_load"
-        headers = {'User-Agent': "Mozilla/5.0"}
+        api_config = API_CONFIG['thaiwater']
+        cache_minutes = api_config['cache_minutes']
         
-        # Station IDs from ThaiWater API
-        STATION_IDS = {
-            2585: "HatYai",       # Kuan Nong Hong — main Hatyai station
-            2590: "Sadao",        # Upstream station
-            2589: "Kallayanamit", # Ban Bang Sala — midstream
-        }
-        PRIMARY_STATION_ID = 2585
+        # Use station metadata from constants
+        station_mapping = {info['id']: name for name, info in STATION_METADATA.items()}
+        primary_station_id = STATION_METADATA['HatYai']['id']
         
         result = {
             "level": None,
@@ -127,56 +163,62 @@ class FloodPredictor:
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-
-        # 1. SMART CHECK: Do we have recent data?
+        
         try:
+            # Atomic check for recent data
             cursor.execute("""
                 SELECT timestamp, station_id, level 
                 FROM water_levels 
-                WHERE timestamp >= datetime('now', '-15 minutes', 'localtime')
-            """)
+                WHERE timestamp >= datetime('now', '-{} minutes')
+                ORDER BY timestamp DESC
+            """.format(cache_minutes))
             rows = cursor.fetchall()
             
             if rows:
-                # We have recent data! Construct result without API call.
-                # Find latest timestamp across all rows
-                latest_ts_str = max(r[0] for r in rows)
-                latest_ts = datetime.strptime(latest_ts_str, '%Y-%m-%d %H:%M:%S')
+                # Process cached data
+                latest_ts_str = rows[0][0]
+                latest_ts = parse_timestamp(latest_ts_str)
                 
-                start_fresh_data = {}
-                for r_ts, r_id, r_lvl in rows:
-                    if r_ts == latest_ts_str:
-                        start_fresh_data[r_id] = r_lvl
+                # Build result from cached data
+                for ts_str, station_id, level in rows:
+                    station_name = station_mapping.get(station_id, station_id)
+                    if ts_str == latest_ts_str:
+                        result["all_data"][station_name] = level
                 
-                result["all_data"] = start_fresh_data
                 result["timestamp"] = latest_ts
                 
-                # Set primary (HatYai) if available
-                if "HatYai" in start_fresh_data:
-                    result["level"] = start_fresh_data["HatYai"]
-                    result["station_code"] = f"ID:{PRIMARY_STATION_ID}"
+                # Set primary reading (prefer HatYai)
+                if "HatYai" in result["all_data"]:
+                    result["level"] = result["all_data"]["HatYai"]
+                    result["station_code"] = f"ID:{primary_station_id}"
                     result["station_name"] = "HatYai"
                     result["is_fallback"] = False
-                elif "Sadao" in start_fresh_data:
-                    result["level"] = start_fresh_data["Sadao"]
-                    result["station_code"] = f"ID:2590"
+                elif "Sadao" in result["all_data"]:
+                    result["level"] = result["all_data"]["Sadao"]
+                    result["station_code"] = f"ID:{STATION_METADATA['Sadao']['id']}"
                     result["station_name"] = "Sadao"
                     result["is_fallback"] = True
                 
                 print(f"[INFO] Using cached DB data from {latest_ts_str}")
-                conn.close()
                 return result
+                
         except Exception as e:
             print(f"[WARN] DB Cache check failed: {e}")
+        finally:
+            conn.close()
 
-        # 2. API FETCH (Fail-fast: 5s timeout)
+        # Fetch from API if no recent data
         try:
-            response = requests.get(api_url, headers=headers, timeout=5)
+            response = requests.get(
+                api_config['url'], 
+                headers={'User-Agent': 'Mozilla/5.0'}, 
+                timeout=api_config['timeout']
+            )
+            
             if response.status_code == 200:
                 data = response.json()
                 
-                # Navigate the nested API structure:
-                # data["waterlevel_data"]["data"] -> list of entries
+                # Navigate API structure
                 entries = []
                 if isinstance(data, dict):
                     wd = data.get('waterlevel_data', {})
@@ -192,76 +234,90 @@ class FloodPredictor:
                 if not isinstance(entries, list):
                     entries = []
                 
-                # Match by station ID
-                for entry in entries:
-                    if not isinstance(entry, dict):
-                        continue
-                    st_info = entry.get('station', {})
-                    if not isinstance(st_info, dict):
-                        continue
-                    
-                    station_id = st_info.get('id')
-                    if station_id not in STATION_IDS:
-                        continue
-                    
-                    name = STATION_IDS[station_id]
-                    raw_val = entry.get('waterlevel_msl') or entry.get('waterlevel') or entry.get('value')
-                    val_float = clean_value(raw_val)
-                    
-                    if val_float is not None:
-                        timestamp_str = entry.get('waterlevel_datetime') or entry.get('datetime')
-                        ts = datetime.now()
-                        if timestamp_str:
-                            try:
-                                ts = datetime.strptime(timestamp_str.strip(), '%Y-%m-%d %H:%M:%S')
-                            except ValueError:
-                                try:
-                                    ts = datetime.strptime(timestamp_str.strip(), '%Y-%m-%d %H:%M')
-                                except ValueError:
-                                    pass
+                # Atomic database operation
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                try:
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                            
+                        st_info = entry.get('station', {})
+                        if not isinstance(st_info, dict):
+                            continue
                         
-                        ts_str = ts.strftime('%Y-%m-%d %H:%M:%S')
-                        cursor.execute(
-                            "INSERT OR IGNORE INTO water_levels (timestamp, station_id, level) VALUES (?, ?, ?)",
-                            (ts_str, name, val_float)
-                        )
-                        result["all_data"][name] = val_float
+                        station_id = st_info.get('id')
+                        if station_id not in station_mapping:
+                            continue
                         
-                        # Set primary reading (prefer HatYai)
-                        if result["level"] is None or station_id == PRIMARY_STATION_ID:
-                            result["level"] = val_float
-                            result["station_code"] = f"ID:{station_id}"
-                            result["station_name"] = name
-                            result["timestamp"] = ts
-                            result["is_fallback"] = (station_id != PRIMARY_STATION_ID)
+                        station_name = station_mapping[station_id]
+                        raw_val = entry.get('waterlevel_msl') or entry.get('waterlevel') or entry.get('value')
+                        val_float = clean_value(raw_val, station_name)
+                        
+                        if val_float is not None:
+                            timestamp_str = entry.get('waterlevel_datetime') or entry.get('datetime')
+                            ts = parse_timestamp(timestamp_str) if timestamp_str else get_bangkok_time()
+                            ts_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            # Atomic insert with ignore for duplicates
+                            cursor.execute(
+                                "INSERT OR IGNORE INTO water_levels (timestamp, station_id, level) VALUES (?, ?, ?)",
+                                (ts_str, station_name, val_float)
+                            )
+                            
+                            result["all_data"][station_name] = val_float
+                            
+                            # Set primary reading
+                            if result["level"] is None or station_id == primary_station_id:
+                                result["level"] = val_float
+                                result["station_code"] = f"ID:{station_id}"
+                                result["station_name"] = station_name
+                                result["timestamp"] = ts
+                                result["is_fallback"] = (station_id != primary_station_id)
+                    
+                    conn.commit()
+                    
+                except Exception as e:
+                    print(f"[ERROR] Database operation failed: {e}")
+                    conn.rollback()
+                finally:
+                    conn.close()
+                    
             else:
                 print(f"[ERROR] API returned {response.status_code}")
-
+                
         except Exception as e:
             print(f"[ERROR] Fetch Failed: {e}")
             
-        conn.commit()
-        conn.close()
         return result
 
     def fetch_rain_forecast(self):
         """
-        Fetch rain forecast from Open-Meteo.
-        Returns BOTH daily (3-day) and hourly (24h) data.
+        Fetch rain forecast from Open-Meteo with proper timezone handling.
+        Returns both daily (3-day) and hourly (24h) data.
         """
         try:
-            url = "https://api.open-meteo.com/v1/forecast"
+            api_config = API_CONFIG['openmeteo']
+            hatyai_coords = STATION_METADATA['HatYai']
+            
             params = {
-                "latitude": 7.0084,
-                "longitude": 100.4767,
+                "latitude": hatyai_coords['lat'],
+                "longitude": hatyai_coords['lon'],
                 "daily": "precipitation_sum",
                 "hourly": "precipitation",
-                "timezone": "Asia/Bangkok",
+                "timezone": SYSTEM_CONFIG['timezone'],
                 "forecast_days": 3
             }
-            res = requests.get(url, params=params, timeout=3)
-            if res.status_code == 200:
-                data = res.json()
+            
+            response = requests.get(
+                api_config['url'], 
+                params=params, 
+                timeout=api_config['timeout']
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
                 daily = data.get("daily", {})
                 hourly = data.get("hourly", {})
                 
@@ -272,59 +328,82 @@ class FloodPredictor:
                 hourly_times = hourly.get("time", [])[:24]
                 hourly_rain = hourly.get("precipitation", [])[:24]
                 
+                # Convert hourly times to Bangkok timezone
+                bangkok_tz = pytz.timezone(SYSTEM_CONFIG['timezone'])
+                formatted_times = []
+                for time_str in hourly_times:
+                    try:
+                        dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+                        bangkok_dt = dt.astimezone(bangkok_tz)
+                        formatted_times.append(bangkok_dt)
+                    except:
+                        formatted_times.append(get_bangkok_time())
+                
                 return {
                     "rain_sum_3d": rain_sum,
                     "raw_daily": daily_rain,
                     "daily_dates": daily.get("time", []),
-                    "hourly_times": hourly_times,
+                    "hourly_times": formatted_times,
                     "hourly_rain": hourly_rain,
-                    "update_time": datetime.now()
+                    "update_time": get_bangkok_time()
                 }
+                
         except Exception as e:
             print(f"[ERROR] Open-Meteo Failed: {e}")
         
-        return {"rain_sum_3d": 0.0, "raw_daily": [], "hourly_times": [], "hourly_rain": [], "error": True}
+        return {
+            "rain_sum_3d": 0.0, 
+            "raw_daily": [], 
+            "hourly_times": [], 
+            "hourly_rain": [], 
+            "error": True,
+            "update_time": get_bangkok_time()
+        }
 
     # =========================================================
     # INTELLIGENCE ENGINE
     # =========================================================
     def analyze_flood_risk(self, sensor_data, rain_data):
         """
-        Risk Intelligence Engine v2:
-        - Weighted Risk: (Rain% * 0.6) + (Sensor% * 0.4)
-        - Time-to-Impact ETA
-        - Historical Comparison
-        - Enhanced Outlook with daily breakdown
+        Advanced Risk Intelligence Engine v3:
+        - Smooth Sigmoid-based Risk Assessment
+        - Hydraulic-aware ETA calculation
+        - Historical Comparison with 2010 benchmark
+        - Physical reality-based logic
         """
         rain_sum = rain_data.get("rain_sum_3d", 0.0)
         current_level = sensor_data.get("level")
         
-        # 1. Normalize Rain Risk (0-100%)
-        rain_risk_pc = min((rain_sum / 150.0) * 100, 100)
+        # 1. Calculate Rain Risk (0-100%)
+        rain_risk_pc = min((rain_sum / RAINFALL_THRESHOLDS['catastrophic_24h']) * 100, 100)
         
-        # 2. Normalize Sensor Risk (0-100%)
-        sensor_risk_pc = 0.0
+        # 2. Calculate Water Level Risk using Sigmoid Function
         if current_level is not None:
-            if current_level < 9.0:
-                sensor_risk_pc = (current_level / 9.0) * 30
-            elif current_level < 10.5:
-                sensor_risk_pc = 30 + ((current_level - 9.0) / 1.5) * 40
-            else:
-                sensor_risk_pc = 70 + ((current_level - 10.5) / 0.5) * 30
-            sensor_risk_pc = min(sensor_risk_pc, 100)
-
-        # 3. Weighted Calculation
-        if sensor_data.get("level") is None:
+            water_risk_pc = sigmoid_risk(
+                current_level, 
+                RISK_CALCULATION['sigmoid_k'], 
+                RISK_CALCULATION['sigmoid_x0']
+            )
+        else:
+            water_risk_pc = 0.0
+        
+        # 3. Combined Risk Assessment (Smooth Weighted Average)
+        if current_level is not None:
+            # Use weighted average for smooth transitions
+            final_risk = (
+                rain_risk_pc * RISK_CALCULATION['rainfall_weight'] + 
+                water_risk_pc * RISK_CALCULATION['water_level_weight']
+            )
+            confidence = 90
+            source = f"Hybrid ({sensor_data.get('station_code')})"
+        else:
+            # No sensor data - rely on rain only
             final_risk = rain_risk_pc
             confidence = 65
             source = "Virtual (Rain Only)"
-        else:
-            final_risk = (rain_risk_pc * 0.6) + (sensor_risk_pc * 0.4)
-            confidence = 90
-            source = f"Hybrid ({sensor_data.get('station_code')})"
-
-        # 4. Alert Level & Color
-        if final_risk > 70:
+        
+        # 4. Enhanced Alert Logic
+        if final_risk > RISK_CALCULATION['critical_min']:
             alert_level = "CRITICAL"
             color = "#ff5252"
             msg_th = "วิกฤต: ความเสี่ยงน้ำท่วมสูงมาก"
@@ -341,7 +420,7 @@ class FloodPredictor:
                 "เตรียมชุดฉุกเฉินและยา",
                 "อพยพผู้สูงอายุ/ผู้พิการ"
             ]
-        elif final_risk > 30:
+        elif final_risk > RISK_CALCULATION['warning_max']:
             alert_level = "WARNING"
             color = "#ffa726"
             msg_th = "เฝ้าระวัง: ฝนตกหนัก / ดินชุ่มน้ำ"
@@ -374,59 +453,84 @@ class FloodPredictor:
                 "เตรียมไฟฉายและถ่านสำรอง"
             ]
 
-        # 5. Outlook Logic
+        # 5. Enhanced Outlook Logic
         daily_rain = rain_data.get("raw_daily", [])
         outlook = {
             "trend": "Analyzing...",
-            "max_rain_day": "N/A",
-            "summary": "Waiting for data...",
+            "trend_en": "Analyzing...", "trend_th": "กำลังวิเคราะห์...",
+            "max_rain_day_label_en": "N/A", "max_rain_day_label_th": "N/A",
+            "max_rain_val": 0,
+            "summary_en": "Waiting for data...", "summary_th": "รอข้อมูล...",
             "daily_vals": [],
-            "daily_labels": []
+            "daily_labels_en": [], "daily_labels_th": []
         }
         
         if daily_rain and len(daily_rain) >= 3:
             d1, d2, d3 = daily_rain[:3]
             
-            if d2 > d1 + 5:
+            # Enhanced trend analysis
+            if d2 > d1 + RAINFALL_THRESHOLDS['light_daily']:
                 trend = "Rising"
-            elif d2 < d1 - 5:
+            elif d2 < d1 - RAINFALL_THRESHOLDS['light_daily']:
                 trend = "Falling"
             else:
                 trend = "Stable"
             
             max_val = max(d1, d2, d3)
             max_idx = [d1, d2, d3].index(max_val)
-            days_labels = ["Tomorrow", "Day 2", "Day 3"]
             
-            if rain_sum < 10:
-                summary = "Dry spell, no flood risk."
-            elif rain_sum < 30:
-                summary = "Light scattered rain."
-            elif rain_sum < 60:
-                summary = "Moderate rain, drains should cope."
-            elif rain_sum < 120:
-                summary = "Heavy rain ahead! Stay alert."
+            # Localization
+            days_labels_th = ["พรุ่งนี้", "อีก 2 วัน", "อีก 3 วัน"]
+            days_labels_en = ["Tomorrow", "Day 2", "Day 3"]
+            
+            # Enhanced summary based on rainfall thresholds
+            if rain_sum < RAINFALL_THRESHOLDS['light_daily']:
+                summary_en = "Dry spell, no flood risk."
+                summary_th = "ฝนทิ้งช่วง ไม่มีความเสี่ยงน้ำท่วม"
+            elif rain_sum < RAINFALL_THRESHOLDS['moderate_daily']:
+                summary_en = "Light scattered rain."
+                summary_th = "มีฝนเล็กน้อยกระจายทั่วไป"
+            elif rain_sum < RAINFALL_THRESHOLDS['heavy_daily']:
+                summary_en = "Moderate rain, drains should cope."
+                summary_th = "ฝนปานกลาง การระบายน้ำยังรับได้"
+            elif rain_sum < RAINFALL_THRESHOLDS['extreme_daily']:
+                summary_en = "Heavy rain ahead! Stay alert."
+                summary_th = "ฝนตกหนัก! โปรดระมัดระวัง"
             else:
-                summary = "EXTREME RAIN. FLOOD LIKELY."
+                summary_en = "EXTREME RAIN. FLOOD LIKELY."
+                summary_th = "ฝนตกหนักมาก! เสี่ยงน้ำท่วมสูง"
+            
+            # Trend localization
+            trend_th = {
+                "Rising": "แนวโน้มเพิ่มขึ้น",
+                "Falling": "แนวโน้มลดลง",
+                "Stable": "ทรงตัว"
+            }.get(trend, "ทรงตัว")
             
             outlook = {
                 "trend": trend,
-                "max_rain_day": f"{days_labels[max_idx]} ({max_val:.1f}mm)",
-                "summary": summary,
+                "trend_en": trend,
+                "trend_th": trend_th,
+                "max_rain_day_label_en": days_labels_en[max_idx],
+                "max_rain_day_label_th": days_labels_th[max_idx],
+                "max_rain_val": round(max_val, 1),
+                "summary_en": summary_en,
+                "summary_th": summary_th,
                 "daily_vals": [round(d1, 1), round(d2, 1), round(d3, 1)],
-                "daily_labels": days_labels
+                "daily_labels_en": days_labels_en,
+                "daily_labels_th": days_labels_th
             }
 
-        # 6. Time-to-Impact
-        eta = self.estimate_time_to_impact(sensor_data)
+        # 6. Advanced Time-to-Impact with Hydraulic Logic
+        eta = self.estimate_time_to_impact_hydraulic(sensor_data)
         
-        # 7. Historical Comparison
-        history = self.get_historical_comparison(rain_sum)
+        # 7. Historical Comparison with Correct 2010 Benchmark
+        history = self.get_historical_comparison_enhanced(rain_sum)
 
-        # 8. Log
+        # 8. Log Assessment
         self._log_risk_assessment(rain_sum, current_level, final_risk, alert_level, source)
 
-        # 9. Summary Generation (New Feature)
+        # 9. Generate Situation Summary
         summary_report = self.generate_situation_summary(rain_sum, sensor_data, final_risk, eta)
 
         return {
@@ -514,87 +618,144 @@ class FloodPredictor:
     # =========================================================
     # TIME-TO-IMPACT ENGINE
     # =========================================================
-    def estimate_time_to_impact(self, sensor_data):
+    def estimate_time_to_impact_hydraulic(self, sensor_data):
         """
-        Estimate how long until upstream water peaks reach Hatyai.
-        Uses distance (60km) / velocity with dynamic adjustment.
+        Advanced ETA calculation using hydraulic principles:
+        - River sinuosity factor for actual distance
+        - Flow velocity based on water height relative to bank full capacity
+        - Realistic lag time accounting for runoff delay
         """
+        all_data = sensor_data.get('all_data', {})
+        sadao_level = all_data.get('Sadao')
+        hatyai_level = all_data.get('HatYai')
+        
+        if sadao_level is None:
+            return {
+                "eta_hours": 0,
+                "eta_label": "No Data",
+                "velocity_ms": 0,
+                "confidence": "Low (No upstream data)",
+                "sadao_rising": False
+            }
+        
+        # Calculate actual river distance with sinuosity
+        actual_distance_km = calculate_actual_distance(
+            RIVER_HYDRAULICS['straight_distance_km'],
+            RIVER_HYDRAULICS['sinuosity_factor']
+        )
+        
+        # Determine base velocity based on water level
+        sadao_bank_full = STATION_METADATA['Sadao']['bank_full_capacity']
+        
+        if sadao_level <= sadao_bank_full * 0.5:
+            # Dry season - very low flow
+            base_velocity = RIVER_HYDRAULICS['base_velocity_dry']
+        elif sadao_level <= sadao_bank_full:
+            # Normal conditions
+            base_velocity = RIVER_HYDRAULICS['base_velocity_normal']
+        else:
+            # Wet season - higher flow
+            base_velocity = RIVER_HYDRAULICS['base_velocity_wet']
+        
+        # Calculate flow velocity using hydraulic principles
+        velocity = calculate_flow_velocity(
+            sadao_level, 
+            sadao_bank_full, 
+            base_velocity
+        )
+        
+        # Get rate of change for dynamic adjustment
         roc = self.calculate_rate_of_change()
         sadao_roc = roc.get("Sadao", 0.0)
         
-        # Adjust velocity based on rate of change
-        # Faster rise = faster flow (more momentum)
-        velocity = BASE_VELOCITY_MS
-        if sadao_roc > 0.5:
-            velocity = 1.2  # Fast flow
-        elif sadao_roc > 0.2:
-            velocity = 1.0  # Moderate flow
-        elif sadao_roc > 0:
-            velocity = 0.8  # Normal flow
-        else:
-            velocity = 0.5  # Slow/receding
+        # Adjust velocity based on rate of change (momentum factor)
+        if sadao_roc > 0.5:  # Rapidly rising
+            velocity *= 1.3
+        elif sadao_roc > 0.2:  # Moderately rising
+            velocity *= 1.1
+        elif sadao_roc < -0.1:  # Falling
+            velocity *= 0.8
         
-        # ETA in hours
-        distance_m = SADAO_TO_HATYAI_KM * 1000
-        eta_seconds = distance_m / velocity
-        eta_hours = eta_seconds / 3600
+        # Ensure velocity stays within realistic bounds
+        velocity = max(0.1, min(velocity, RIVER_HYDRAULICS['max_velocity']))
         
-        # Confidence
-        sadao_val = sensor_data.get("all_data", {}).get("Sadao")
-        if sadao_val is not None and sadao_roc > 0:
+        # Calculate ETA with lag time
+        eta_hours = calculate_eta_hours(
+            actual_distance_km, 
+            velocity, 
+            RIVER_HYDRAULICS['runoff_delay_hours']
+        )
+        
+        # Confidence assessment
+        if sadao_level > sadao_bank_full and sadao_roc > 0:
             conf = "High"
-        elif sadao_val is not None:
+        elif sadao_level > sadao_bank_full * 0.8:
             conf = "Medium"
         else:
-            conf = "Low (No upstream data)"
+            conf = "Low"
         
         return {
             "eta_hours": round(eta_hours, 1),
             "eta_label": f"~{int(eta_hours)} hrs",
-            "velocity_ms": round(velocity, 1),
+            "velocity_ms": round(velocity, 2),
             "confidence": conf,
-            "sadao_rising": sadao_roc > 0
+            "sadao_rising": sadao_roc > 0,
+            "actual_distance_km": actual_distance_km,
+            "sadao_level": sadao_level,
+            "bank_full_ratio": sadao_level / sadao_bank_full
         }
 
-    # =========================================================
-    # HISTORICAL COMPARISON
-    # =========================================================
-    def get_historical_comparison(self, current_rain_3d):
+    def get_historical_comparison_enhanced(self, current_rain_3d):
         """
-        Compare current conditions to historical flood events.
+        Enhanced historical comparison using correct 2010 benchmark (520mm).
+        Provides context against major flood events.
         """
         if current_rain_3d <= 0:
             return {
                 "nearest_event": None,
                 "percentage": 0,
-                "message": "No significant rainfall."
+                "message": "No significant rainfall.",
+                "severity": "NONE"
             }
+        
+        # Use correct 2010 benchmark
+        benchmark_2010 = HISTORICAL_EVENTS[2010]['rain_mm_3d']
         
         # Find nearest historical event
         nearest = None
         min_diff = float('inf')
         for year, event in HISTORICAL_EVENTS.items():
-            diff = abs(event["rain_mm"] - current_rain_3d)
+            diff = abs(event['rain_mm_3d'] - current_rain_3d)
             if diff < min_diff:
                 min_diff = diff
                 nearest = {"year": year, **event}
         
-        # Calculate percentage of worst event (2010)
-        pct_of_worst = round((current_rain_3d / 500) * 100, 1)
+        # Calculate percentage of 2010 catastrophe
+        pct_of_2010 = round((current_rain_3d / benchmark_2010) * 100, 1)
         
+        # Enhanced messaging based on severity
         if current_rain_3d < 50:
             msg = "Well below any historical flood event."
+            severity = "LOW"
         elif current_rain_3d < 150:
-            msg = f"~{pct_of_worst}% of 2010 event intensity."
+            msg = f"~{pct_of_2010}% of 2010 event intensity. Minor risk."
+            severity = "MINOR"
         elif current_rain_3d < 300:
-            msg = f"Approaching {nearest['label']} levels ({pct_of_worst}% of 2010)."
+            msg = f"Approaching {nearest['label']} levels ({pct_of_2010}% of 2010)."
+            severity = "MODERATE"
+        elif current_rain_3d < 450:
+            msg = f"HIGH RISK: Similar to {nearest['label']} ({pct_of_2010}% of 2010)."
+            severity = "HIGH"
         else:
-            msg = f"DANGER: Exceeding {nearest['label']}! ({pct_of_worst}% of 2010 catastrophe)"
+            msg = f"DANGER: Exceeding {nearest['label']}! ({pct_of_2010}% of 2010 catastrophe)"
+            severity = "CRITICAL"
         
         return {
             "nearest_event": nearest,
-            "percentage": pct_of_worst,
-            "message": msg
+            "percentage": pct_of_2010,
+            "message": msg,
+            "severity": severity,
+            "benchmark_2010_mm": benchmark_2010
         }
 
     # =========================================================
@@ -614,6 +775,9 @@ class FloodPredictor:
             print(f"[WARN] Failed to log risk: {e}")
 
     def get_latest_data(self, hours=24):
+        """
+        Get latest water level data with proper timezone handling.
+        """
         conn = sqlite3.connect(self.db_path)
         query = f"""
             SELECT timestamp, station_id, level 
@@ -625,19 +789,42 @@ class FloodPredictor:
         conn.close()
         
         if not df.empty:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
+            # Convert timestamps with timezone awareness
+            df['timestamp'] = df['timestamp'].apply(lambda x: parse_timestamp(x))
             df = df.dropna(subset=['timestamp'])
-            df = df[df['level'] > -5.0]
+            
+            # Apply station-specific validation
+            valid_rows = []
+            for _, row in df.iterrows():
+                station_id = row['station_id']
+                level = row['level']
+                min_threshold = STATION_METADATA.get(station_id, {}).get('min_valid_level', -5.0)
+                if level > min_threshold:
+                    valid_rows.append(row)
+            
+            if valid_rows:
+                df = pd.DataFrame(valid_rows)
+            else:
+                df = pd.DataFrame(columns=['timestamp', 'station_id', 'level'])
+        
         return df
 
     def calculate_rate_of_change(self):
+        """
+        Calculate rate of change for each station over the last 2 hours.
+        Uses proper timezone-aware calculations.
+        """
         df = self.get_latest_data(hours=2)
         rates = {}
         
         if df.empty:
             return rates
             
-        start_time_limit = df['timestamp'].max() - timedelta(hours=1.5)
+        # Use Bangkok time for consistent calculations
+        bangkok_tz = pytz.timezone(SYSTEM_CONFIG['timezone'])
+        now = get_bangkok_time()
+        start_time_limit = now - timedelta(hours=1.5)
+        
         unique_stations = df['station_id'].unique()
         
         for station in unique_stations:
@@ -663,34 +850,40 @@ class FloodPredictor:
     # PREDICTION MODEL
     # =========================================================
     def train_prediction_model(self):
-        # Cache model for 30 minutes to avoid retraining on every page load
-        now = datetime.now()
+        """
+        Enhanced prediction model with proper caching and timezone handling.
+        """
+        # Cache model for 30 minutes
+        now = get_bangkok_time()
         if (self._cached_model is not None 
             and self._cached_model_time is not None
             and (now - self._cached_model_time).total_seconds() < 1800):
             return self._cached_model, self._cached_model_lag
         
-        df = self.get_latest_data(hours=168)
+        df = self.get_latest_data(hours=168)  # 7 days
         
         if df.empty:
             return None, 0
 
+        # Create pivot table with proper timezone handling
         df_pivot = df.pivot_table(index='timestamp', columns='station_id', values='level').dropna()
         df_hourly = df_pivot.resample('1h').mean().interpolate()
         
         if 'HatYai' not in df_hourly.columns or 'Sadao' not in df_hourly.columns:
             return None, 0
             
+        # Find optimal lag with correlation analysis
         max_corr = -1
         best_lag = 0
         
-        for lag in range(1, 13):
+        for lag in range(1, 13):  # 1-12 hours lag
             sadao_shifted = df_hourly['Sadao'].shift(lag)
             corr = df_hourly['HatYai'].corr(sadao_shifted)
             if corr > max_corr:
                 max_corr = corr
                 best_lag = lag
                 
+        # Prepare training data
         data = pd.concat([df_hourly['HatYai'], df_hourly['Sadao'].shift(best_lag)], axis=1).dropna()
         data.columns = ['HatYai', 'Sadao_Lagged']
         
@@ -700,9 +893,11 @@ class FloodPredictor:
         X = data[['Sadao_Lagged']]
         y = data['HatYai']
         
+        # Train model
         model = LinearRegression()
         model.fit(X, y)
         
+        # Cache the model
         self._cached_model = model
         self._cached_model_lag = best_lag
         self._cached_model_time = now
@@ -710,18 +905,23 @@ class FloodPredictor:
         return model, best_lag
 
     def predict_next_hours(self, hours=3):
+        """
+        Enhanced prediction with proper timezone handling.
+        """
         model, lag = self.train_prediction_model()
         
         if model is None:
             return []
         
         predictions = []
-        current_time = datetime.now()
+        current_time = get_bangkok_time()
         
-        df = self.get_latest_data(hours=lag+hours+5)
+        # Get more historical data for better predictions
+        df = self.get_latest_data(hours=lag+hours+24)
         if df.empty:
             return []
             
+        # Prepare Sadao data
         df_sadao = df[df['station_id'] == 'Sadao'].set_index('timestamp')[['level']].resample('1h').mean().interpolate()
         
         for h in range(1, hours + 1):
@@ -729,11 +929,21 @@ class FloodPredictor:
             target_sadao_time = future_time - timedelta(hours=lag)
             
             try:
-                idx = df_sadao.index.get_indexer([target_sadao_time], method='nearest')[0]
-                sadao_val = df_sadao.iloc[idx]['level']
-                pred_level = model.predict([[sadao_val]])[0]
-                predictions.append({"time": future_time, "level": pred_level})
-            except Exception:
+                # Find nearest Sadao data
+                if len(df_sadao) > 0:
+                    time_diffs = abs(df_sadao.index - target_sadao_time)
+                    nearest_idx = time_diffs.idxmin()
+                    sadao_val = df_sadao.loc[nearest_idx, 'level']
+                    
+                    # Make prediction
+                    pred_level = model.predict([[sadao_val]])[0]
+                    predictions.append({
+                        "time": future_time, 
+                        "level": pred_level,
+                        "confidence": "Medium" if lag <= 6 else "Low"
+                    })
+            except Exception as e:
+                print(f"[WARN] Prediction failed for hour {h}: {e}")
                 pass
                 
         return predictions

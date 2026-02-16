@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from models.flood_predictor import FloodPredictor, clean_value
+from models.flood_predictor import FloodPredictor, clean_value, get_bangkok_time
+from constants import EMERGENCY_CONTACTS, EVACUATION_ZONES, STATION_METADATA
 
 # =============================================================
 # 1. PAGE CONFIG
@@ -15,7 +16,7 @@ st.set_page_config(
 )
 
 # =============================================================
-# 2. TRANSLATIONS
+# 2. TRANSLATIONS (Enhanced with Emergency Messages)
 # =============================================================
 TRANSLATIONS = {
     "EN": {
@@ -53,14 +54,14 @@ TRANSLATIONS = {
         "rain_card": "Rain Accumulation",
         "rain_unit": "3-Day Total",
         "hatyai_card": "Hatyai Level",
-        "hatyai_unit": "Station X.44",
-        "sadao_card": "Sadao Level",
-        "sadao_unit": "Station X.173",
+        "hatyai_unit": "Station X.44 • Economic Zone Watch",
+        "sadao_card": "Upstream Level",
+        "sadao_unit": "Sadao (X.173) • Early warning 15-20 hrs",
         "forecast_card": "AI Prediction",
         "forecast_unit": "+3 Hour Model",
         "chart_water": "Water Level Analysis (24h)",
         "chart_rain_hourly": "Precipitation Intensity (Next 24h)",
-        "pipeline_title": "Basin Flow Status",
+        "pipeline_title": "Water Level (m)",
         "sensor_offline": "Offline",
         "processing": "Analyzing...",
         "about_title": "ℹ️ About This System",
@@ -72,6 +73,7 @@ HYFI utilizes **Hybrid Intelligence** to calculate flood risks:
 - **Live Local Sensors**: Real-time water level data from Hatyai Municipality (X.44, X.90, X.173).
 - **Global Rain Model**: 3-day accumulated rainfall forecasts from **Open-Meteo API**.
 - **Automatic Virtual Mode**: If sensors fail, the system switches to use global rainfall data exclusively.
+- **Advanced Hydraulic Logic**: River sinuosity factor and flow velocity calculations for accurate ETA.
 
 **📍 2. Coverage Area**
 - **Upstream (Sadao)**: Station X.173 - Monitoring water from the south.
@@ -88,8 +90,13 @@ HYFI utilizes **Hybrid Intelligence** to calculate flood risks:
 - **Yellow**: Move belongings up, check fuel/batteries.
 - **Red**: Move vehicles to safe zones (e.g., PSU Pumpkin Bldg), cut ground-floor power.
 
+**🆘 5. Emergency Response**
+- **Critical Mode**: Automatic display of emergency contacts and evacuation routes.
+- **Real-time ETA**: Advanced hydraulic calculations for water arrival time.
+- **Historical Context**: Comparison with 2010 Great Flood benchmark.
+
 **⚠️ Disclaimer & Privacy**
-Data is based on statistical models. Please use as a guide alongside official municipal announcements.
+Data is based on statistical models and hydraulic principles. Please use as a guide alongside official municipal announcements.
 *Developed by ICT Students, Faculty of Science, PSU.*
         """,
     },
@@ -128,14 +135,14 @@ Data is based on statistical models. Please use as a guide alongside official mu
         "rain_card": "ฝนสะสม",
         "rain_unit": "รวม 3 วัน",
         "hatyai_card": "ระดับน้ำหาดใหญ่",
-        "hatyai_unit": "สถานี X.44",
-        "sadao_card": "ระดับน้ำสะเดา",
-        "sadao_unit": "สถานี X.173",
+        "hatyai_unit": "สถานี X.44 • จุดเฝ้าระวังเขตเมืองเศรษฐกิจ",
+        "sadao_card": "ระดับน้ำต้นน้ำ",
+        "sadao_unit": "อ.สะเดา (X.173) • แจ้งเตือนล่วงหน้า 15-20 ชม.",
         "forecast_card": "คาดการณ์",
         "forecast_unit": "+3 ชม.",
         "chart_water": "ระดับน้ำย้อนหลัง 24 ชม.",
         "chart_rain_hourly": "ความเข้มข้นฝนรายชั่วโมง (24 ชม.)",
-        "pipeline_title": "สถานะการไหลของน้ำในลุ่มน้ำ",
+        "pipeline_title": "ระดับน้ำในคลอง (ม.)",
         "sensor_offline": "ออฟไลน์",
         "processing": "กำลังวิเคราะห์...",
         "about_title": "ℹ️ เกี่ยวกับระบบนี้",
@@ -147,6 +154,7 @@ Data is based on statistical models. Please use as a guide alongside official mu
 - **ข้อมูลสดจากพื้นที่**: ระดับน้ำจริงจากสถานีเทศบาล (X.44, X.90, X.173)
 - **ข้อมูลพยากรณ์โลก**: ปริมาณฝนสะสม 3 วันจาก **Open-Meteo API**
 - **ระบบสำรองอัตโนมัติ (Virtual Mode)**: หากเซนเซอร์ล่ม ระบบจะใช้ข้อมูลฝนคำนวณแทนทันที
+- **ตรรกะทางไฮดรอลิกขั้นสูง**: ปัจจัยความคดเคี้ยวของแม่น้ำและการคำนวณความเร็วกระแสน้ำสำหรับ ETA ที่แม่นยำ
 
 **📍 2. พื้นที่การติดตาม**
 - **ต้นน้ำ (อ.สะเดา)**: สถานี X.173 - ด่านหน้าทิศใต้
@@ -163,8 +171,13 @@ Data is based on statistical models. Please use as a guide alongside official mu
 - **สีเหลือง**: ยกของขึ้นที่สูง, เช็คระดับน้ำมัน/แบตสำรอง
 - **สีแดง**: ย้ายรถไปที่สูง (เช่น ตึกฟักทอง), ตัดไฟชั้นล่าง
 
+**🆘 5. การตอบสนองฉุกเฉิน**
+- **โหมดวิกฤต**: แสดงข้อมูลติดต่อฉุกเฉินและเส้นทางอพยพอัตโนมัติ
+- **ETA แบบเรียลไทม์**: การคำนวณทางไฮดรอลิกขั้นสูงสำหรับเวลาถึงของน้ำ
+- **บริบททางประวัติศาสตร์**: เปรียบเทียบกับมาตรฐานมหาอุทกภัยปี 2010
+
 **⚠️ หมายเหตุ**
-ผลลัพธ์มาจากการคำนวณทางสถิติ โปรดใช้ประกอบการตัดสินใจควบคู่กับประกาศทางการ
+ผลลัพธ์มาจากการคำนวณทางสถิติและหลักการทางไฮดรอลิก โปรดใช้ประกอบการตัดสินใจควบคู่กับประกาศทางการ
 *พัฒนาโดย นักศึกษา ICT คณะวิทยาศาสตร์ ม.อ.*
         """,
     }
@@ -242,7 +255,7 @@ div[data-testid="stMetric"]:hover {
     box-shadow: 0 8px 16px rgba(0,0,0,0.06);
 }
 div[data-testid="stMetric"] label { color: var(--muted) !important; font-weight: 600 !important; text-transform: uppercase !important; font-size: 0.78rem !important; letter-spacing: 0.05em !important; }
-div[data-testid="stMetric"] div[data-testid="stMetricValue"] { color: var(--text) !important; font-weight: 700 !important; }
+div[data-testid="stMetric"] div[data-testid="stMetricValue"] { font-weight: 700 !important; }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -324,13 +337,14 @@ def main():
     roc = predictor.calculate_rate_of_change()
     preds = predictor.predict_next_hours(3)
     
-    last_update = sensor_data.get("timestamp") or datetime.now()
+    # Timezone handling with proper Bangkok time
+    last_update = sensor_data.get("timestamp") or get_bangkok_time()
     last_update_str = last_update.strftime('%d/%m/%Y %H:%M')
 
     # === HEADER ===
     st.markdown(f"# {t['title']}")
     # Clean up data source display (remove ID)
-    source_display = risk_report['data_source'].split('(')[0].strip()
+    source_display = risk_report['data_source']
     st.caption(f"{t['subtitle']} — {t['last_update']}: {last_update_str} | {t['source']}: {source_display}")
 
     if sensor_data['is_fallback']:
@@ -450,6 +464,84 @@ def main():
     st.markdown("---")
 
     # ==========================================================
+    # EMERGENCY RESPONSE SECTION (Critical Mode)
+    # ==========================================================
+    if risk_report['alert_level'] == 'CRITICAL':
+        st.markdown("---")
+        st.markdown("### 🆘 EMERGENCY RESPONSE ACTIVATED")
+        
+        # Emergency alert banner
+        st.markdown(
+            f"""
+            <div style="background:linear-gradient(135deg, #ff5252, #ff1744);color:white;padding:20px;border-radius:12px;margin-bottom:20px;text-align:center;box-shadow:0 4px 20px rgba(255,23,68,0.3);">
+                <h2 style="margin:0;color:white;font-size:1.8rem;">🚨 CRITICAL FLOOD WARNING 🚨</h2>
+                <p style="margin:10px 0 0 0;font-size:1.1rem;opacity:0.9;">Immediate action required. Risk Level: {risk_report['primary_risk']}%</p>
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
+        
+        # Emergency contacts and evacuation info
+        col_emergency, col_evacuation = st.columns(2, gap="large")
+        
+        with col_emergency:
+            st.markdown("#### 📞 Emergency Contacts")
+            
+            emergency_info = [
+                ("🚨 Disaster Prevention", EMERGENCY_CONTACTS['disaster_prevention']),
+                ("🏥 Hatyai Municipality", EMERGENCY_CONTACTS['hatyai_municipality']),
+                ("💧 Water Resources", EMERGENCY_CONTACTS['water_resources']),
+                ("🚑 Hospital Emergency", EMERGENCY_CONTACTS['hospital_emergency']),
+                ("🛡️ PSU Security", EMERGENCY_CONTACTS['psu_security'])
+            ]
+            
+            for service, number in emergency_info:
+                st.markdown(
+                    f"""
+                    <div style="background:white;border:1px solid #e2e8f0;border-left:4px solid #ff5252;padding:12px;border-radius:8px;margin-bottom:8px;">
+                        <div style="font-weight:600;color:#1e293b;">{service}</div>
+                        <div style="font-size:1.2rem;color:#ff5252;font-weight:700;">{number}</div>
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
+        
+        with col_evacuation:
+            st.markdown("#### 🏃 Evacuation Zones")
+            
+            # High priority evacuation zones
+            st.markdown(
+                """
+                <div style="background:#fee2e2;border:1px solid #fecaca;border-radius:8px;padding:15px;margin-bottom:15px;">
+                    <h4 style="color:#dc2626;margin-top:0;">🔴 HIGH PRIORITY - Evacuate Immediately</h4>
+                    <ul style="margin:10px 0;padding-left:20px;">
+                """, 
+                unsafe_allow_html=True
+            )
+            
+            for zone in EVACUATION_ZONES['high_priority']:
+                st.markdown(f"<li style='margin-bottom:5px;color:#7f1d1d;'>{zone}</li>", unsafe_allow_html=True)
+            
+            st.markdown("</ul></div>", unsafe_allow_html=True)
+            
+            # Safe zones
+            st.markdown(
+                """
+                <div style="background:#dcfce7;border:1px solid #bbf7d0;border-radius:8px;padding:15px;">
+                    <h4 style="color:#166534;margin-top:0;">🟢 SAFE ZONES</h4>
+                    <ul style="margin:10px 0;padding-left:20px;">
+                """, 
+                unsafe_allow_html=True
+            )
+            
+            for zone in EVACUATION_ZONES['safe_zones']:
+                st.markdown(f"<li style='margin-bottom:5px;color:#166534;'>{zone}</li>", unsafe_allow_html=True)
+            
+            st.markdown("</ul></div>", unsafe_allow_html=True)
+        
+        st.markdown("---")
+
+    # ==========================================================
     # SECTION 1.5: CHECKLIST (Full Width)
     # ==========================================================
     st.markdown(f"#### 📋 {t['checklist_title']}")
@@ -483,18 +575,18 @@ def main():
             label = f"{color_dot} {name}"
             st.metric(label=label, value=f"{fmt(val)} m" if val is not None else t['sensor_offline'], help=code)
 
-    pipecard(p1, "Sadao", "Station X.173", sadao_v, dot(sadao_v))
+    pipecard(p1, "Sadao", t['sadao_unit'], sadao_v, dot(sadao_v))
     
     with a1:
         st.markdown(f"<div style='text-align:center;padding-top:28px;color:#cbd5e1;font-size:2rem;font-weight:800;'>➔</div>", unsafe_allow_html=True)
         # st.caption(f"~{int(eta_hrs * 0.4)}h") # Removed for cleaner look
 
-    pipecard(p2, "Bang Sala", "Station X.44", kalla_v, dot(kalla_v))
+    pipecard(p2, "Bang Sala", "Bang Sala (X.44)", kalla_v, dot(kalla_v))
     
     with a2:
         st.markdown(f"<div style='text-align:center;padding-top:28px;color:#cbd5e1;font-size:2rem;font-weight:800;'>➔</div>", unsafe_allow_html=True)
 
-    pipecard(p3, "Hatyai", "Station X.90", hatyai_v, dot(hatyai_v))
+    pipecard(p3, "Hatyai", t['hatyai_unit'], hatyai_v, dot(hatyai_v))
 
     # ==========================================================
     # SECTION 3: METRIC CARDS
@@ -511,12 +603,28 @@ def main():
     with c2:
         val = clean_value(sensor_data.get('level'))
         delta = roc.get(sensor_data.get('station_name'), 0)
-        st.metric(
-            label=f"📍 {t['hatyai_card']}",
-            value=f"{fmt(val)} m" if val is not None else t['sensor_offline'],
-            delta=f"{delta:+.2f} m/h" if val is not None else None,
-            delta_color="inverse",
-            help=t['hatyai_unit']
+        
+        # Dynamic Color Logic
+        val_color = "var(--text)"
+        if val is not None:
+            if val > CRITICAL_LEVEL: val_color = "#ef4444"
+            elif val > WARNING_LEVEL: val_color = "#eab308"
+            
+        st.markdown(
+            f"""
+            <div style="background:white;border:1px solid #e2e8f0;border-radius:12px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.04);transition:all 0.3s ease;">
+                <label style="color:#64748b;font-weight:600;text-transform:uppercase;font-size:0.78rem;letter-spacing:0.05em;" title="{t['hatyai_unit']}">
+                    📍 {t['hatyai_card']}
+                </label>
+                <div style="color:{val_color};font-weight:700;font-size:1.8rem;line-height:1.4;">
+                    {fmt(val)} <span style="font-size:1rem;color:#64748b;">m</span>
+                </div>
+                <div style="font-size:0.9rem;color:{'#ef4444' if delta > 0 else '#22c55e'};font-weight:500;">
+                    {delta:+.2f} m/h
+                </div>
+            </div>
+            """, 
+            unsafe_allow_html=True
         )
 
     with c3:
@@ -543,19 +651,23 @@ def main():
     outlook = risk_report.get('outlook', {})
     with col_out:
         st.markdown(f"#### 📅 {t['outlook_title']}")
-        trend_val = outlook.get('trend', 'N/A')
-        # Translate trend if needed
-        trend_map = {"Rising": "📈 Rising", "Falling": "📉 Falling", "Stable": "➡️ Stable"}
-        if st.session_state.lang == "TH":
-             trend_map = {"Rising": "📈 แนวโน้มขึ้น", "Falling": "📉 แนวโน้มลดลง", "Stable": "➡️ ทรงตัว"}
         
-        st.markdown(f"**{t['trend']}:** {trend_map.get(trend_val, trend_val)}")
-        st.markdown(f"**{t['peak_day']}:** {outlook.get('max_rain_day', '--')}")
-        st.info(f"💬 {outlook.get('summary', 'Waiting...')}")
+        # Localized Trend
+        trend_val = outlook.get(f'trend_{lang_key}', outlook.get('trend', 'N/A'))
+        st.markdown(f"**{t['trend']}:** {trend_val}")
+        
+        # Localized Peak Day
+        peak_day = outlook.get(f'max_rain_day_label_{lang_key}', '--')
+        peak_val = outlook.get('max_rain_val', 0)
+        st.markdown(f"**{t['peak_day']}:** {peak_day} ({peak_val} mm)")
+        
+        # Localized Summary
+        summ_txt = outlook.get(f'summary_{lang_key}', 'Waiting...')
+        st.info(f"💬 {summ_txt}")
         
         # Daily bars
         dv = outlook.get('daily_vals', [])
-        dl = outlook.get('daily_labels', [])
+        dl = outlook.get(f'daily_labels_{lang_key}', [])
         if dv and dl:
             fig_daily = go.Figure(data=[
                 go.Bar(
@@ -589,7 +701,7 @@ def main():
         colors = []
         for year, evt in sorted(HISTORICAL_EVENTS.items()):
             years.append(str(year))
-            rains.append(evt['rain_mm'])
+            rains.append(evt['rain_mm_3d'])
             # Color logic: Red for 2010, Blue for NOW
             if year == 2010: colors.append('#ef4444') # 2010 High Risk
             else: colors.append('#cbd5e1')
