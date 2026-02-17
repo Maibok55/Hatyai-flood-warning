@@ -4,6 +4,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from models.flood_predictor import FloodPredictor, clean_value, get_bangkok_time
 from constants import EMERGENCY_CONTACTS, EVACUATION_ZONES, STATION_METADATA
+from hatyai_scraper import scrape_hatyai_climate, check_zombie_data
 
 # =============================================================
 # 1. PAGE CONFIG
@@ -263,8 +264,9 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # =============================================================
 # 4. INITIALIZATION
 # =============================================================
-CRITICAL_LEVEL = 10.5
-WARNING_LEVEL = 9.0
+# Use station-specific thresholds from verified API data
+CRITICAL_LEVEL = STATION_METADATA['HatYai']['critical_threshold']   # 8.88m MSL (bank overflow)
+WARNING_LEVEL  = STATION_METADATA['HatYai']['warning_threshold']    # 7.38m MSL (bank - 1.5m)
 
 # Removed cache_resource to ensure latest code is used
 # @st.cache_resource
@@ -277,11 +279,18 @@ def fmt(v):
     """Safe formatting for sensor values that may be None."""
     return f"{v:.2f}" if v is not None else "—"
 
-def dot(v):
-    """Status indicator dot for a sensor value."""
+def dot(v, station_name=None):
+    """Status indicator dot for a sensor value, station-aware."""
     if v is None: return "⚪"
-    if v > CRITICAL_LEVEL: return "🔴"
-    if v > WARNING_LEVEL: return "🟡"
+    if station_name and station_name in STATION_METADATA:
+        meta = STATION_METADATA[station_name]
+        crit = meta.get('critical_threshold', CRITICAL_LEVEL)
+        warn = meta.get('warning_threshold', WARNING_LEVEL)
+    else:
+        crit = CRITICAL_LEVEL
+        warn = WARNING_LEVEL
+    if v > crit: return "🔴"
+    if v > warn: return "🟡"
     return "🟢"
 
 # =============================================================
@@ -331,6 +340,17 @@ def main():
         sensor_data = _fetch_sensor()
         rain_data = _fetch_rain()
     
+    # --- HYBRID INTELLIGENCE: Zombie Data Detection ---
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _fetch_local_intel():
+        return scrape_hatyai_climate()
+    
+    local_intel = _fetch_local_intel()
+    zombie_report = {}
+    
+    if local_intel.get('success') and local_intel.get('outage_stations'):
+        sensor_data, zombie_report = check_zombie_data(sensor_data, local_intel)
+    
     risk_report = predictor.analyze_flood_risk(sensor_data, rain_data)
     
     latest_df = predictor.get_latest_data(hours=24)
@@ -349,6 +369,26 @@ def main():
 
     if sensor_data['is_fallback']:
         st.warning(f"⚠️ Sensor data unavailable. Using **{source_display}** ({risk_report['confidence_score']}%)")
+    
+    # --- ZOMBIE DATA WARNING ---
+    if zombie_report:
+        for station, info in zombie_report.items():
+            if station == '_scraper':
+                continue
+            zombie_val = info.get('zombie_value', '?')
+            reason = info.get('reason', 'Unknown')
+            if st.session_state.lang == "TH":
+                st.error(
+                    f"🧟 **ตรวจพบข้อมูลผี (Zombie Data)** — สถานี **{station}** "
+                    f"ส่งค่า **{zombie_val}m** แต่เซนเซอร์มีปัญหา: _{reason}_\n\n"
+                    f"→ ระบบ **ละเว้นค่านี้** และใช้ข้อมูลสำรองแทน"
+                )
+            else:
+                st.error(
+                    f"🧟 **Zombie Data Detected** — Station **{station}** "
+                    f"reported **{zombie_val}m** but sensor has issues: _{reason}_\n\n"
+                    f"→ System **ignoring this value** and using fallback data."
+                )
 
     # ==========================================================
     # SECTION 1: HERO — Risk Gauge + ETA + Situation Report
@@ -400,20 +440,36 @@ def main():
             unsafe_allow_html=True
         )
 
-        # 3. ETA Card (Compact)
+        # 3. ETA Card (Context-aware: don't show travel time during normal conditions)
         eta = risk_report.get('eta', {})
-        bg_eta = "#eff6ff"
-        if eta.get('eta_hours', 20) < 6: bg_eta = "#fee2e2"
+        eta_hours = eta.get('eta_hours', 0)
+        sadao_rising = eta.get('sadao_rising', False)
+        bank_ratio = eta.get('bank_full_ratio', 0)
+        
+        # Only show ETA hours when it's meaningful (upstream is rising or >70% bank)
+        vel = eta.get('velocity_ms', 0)
+        if sadao_rising or bank_ratio > 0.7:
+            bg_eta = "#fee2e2" if eta_hours < 6 else "#eff6ff"
+            eta_display = eta.get('eta_label', '--')
+            velocity_display = f"{t['eta_speed']}: <b>{vel} m/s</b>"
+        else:
+            bg_eta = "#f0fdf4"  # green-ish = safe
+            if lang_key == 'th':
+                eta_display = "ปกติ"
+                velocity_display = f"กระแสน้ำ: <b>{vel} m/s</b>"
+            else:
+                eta_display = "Normal"
+                velocity_display = f"Flow: <b>{vel} m/s</b>"
         
         st.markdown(
             f"""
             <div style="background:{bg_eta};padding:12px;border-radius:10px;border:1px solid #dae1e7;text-align:center;margin-top:8px;">
                 <div style="display:flex;justify-content:space-between;align-items:center;">
-                    <span style="color:#64748b;font-size:0.85rem;font-weight:600;">⏱️ {t['eta_title']}</span>
-                    <span style="color:#1e293b;font-size:1.1rem;font-weight:800;">{eta.get('eta_label', '--')}</span>
+                    <span style="color:#64748b;font-size:0.85rem;font-weight:600;">\u23f1\ufe0f {t['eta_title']}</span>
+                    <span style="color:#1e293b;font-size:1.1rem;font-weight:800;">{eta_display}</span>
                 </div>
                 <div style="font-size:0.75rem;color:#64748b;text-align:right;margin-top:2px;">
-                    {t['eta_speed']}: <b>{eta.get('velocity_ms', 0.8)} m/s</b>
+                    {velocity_display}
                 </div>
             </div>
             """, 
@@ -561,32 +617,84 @@ def main():
     st.markdown(f"### 🔗 {t['pipeline_title']}")
     
     all_data = sensor_data.get("all_data", {})
+    bank_info = sensor_data.get("bank_info", {})
     sadao_v = clean_value(all_data.get("Sadao"))
     hatyai_v = clean_value(all_data.get("HatYai"))
     kalla_v = clean_value(all_data.get("Kallayanamit"))
     eta_hrs = eta.get('eta_hours', 21)
 
+    # Calculate water depth and bank margin for each station
+    # Prefer API's diff_wl_bank, fallback to calculated
+    def station_info(station_name, msl_value):
+        """Convert MSL to depth + bank distance."""
+        meta = STATION_METADATA.get(station_name, {})
+        ground = meta.get('ground_level', 0)
+        bank = meta.get('bank_full_capacity', 0)
+        api_bank = bank_info.get(station_name, {})
+        
+        if msl_value is not None:
+            depth = round(msl_value - ground, 2)
+            # Use API diff_wl_bank if available (negative = safe, positive = overtopping)
+            api_diff = api_bank.get('diff_wl_bank')
+            if api_diff is not None:
+                left_to_bank = round(abs(api_diff), 2)
+                is_overtopping = api_diff > 0
+            else:
+                left_to_bank = round(bank - msl_value, 2)
+                is_overtopping = msl_value > bank
+            return {'depth': depth, 'left_to_bank': left_to_bank, 'msl': msl_value, 'overtopping': is_overtopping}
+        return {'depth': None, 'left_to_bank': None, 'msl': None, 'overtopping': False}
+    
+    sadao_info = station_info('Sadao', sadao_v)
+    hatyai_info = station_info('HatYai', hatyai_v)
+    kalla_info = station_info('Kallayanamit', kalla_v)
+
     p1, a1, p2, a2, p3 = st.columns([2, 0.8, 2, 0.8, 2])
     
-    # Helper for pipeline card
-    def pipecard(col, name, code, val, color_dot):
+    lang = st.session_state.lang
+    
+    # Helper for pipeline card — bold name, depth, "อีก X ม. จะล้นตลิ่ง"
+    def pipecard(col, name, info, color_dot, station_key):
         with col:
-            # Put name INSIDE the label for card effect
-            label = f"{color_dot} {name}"
-            st.metric(label=label, value=f"{fmt(val)} m" if val is not None else t['sensor_offline'], help=code)
+            if info['depth'] is not None:
+                val_str = f"{info['depth']:.1f}m"
+                ltb = info['left_to_bank']
+                if info['overtopping']:
+                    bank_text = f"น้ำล้นตลิ่ง {ltb:.1f}m" if lang == 'th' else f"Overtopping {ltb:.1f}m"
+                    bank_color = '#ef4444'
+                else:
+                    bank_text = f"อีก {ltb:.1f} ม. จะล้นตลิ่ง" if lang == 'th' else f"{ltb:.1f}m to bank"
+                    bank_color = '#22c55e' if ltb > 3 else ('#eab308' if ltb > 1 else '#ef4444')
+                st.markdown(
+                    f"""
+                    <div style="background:white;border:1px solid #e2e8f0;border-radius:12px;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,0.04);">
+                        <div style="font-weight:800;font-size:1.05rem;color:#0f172a;margin-bottom:4px;">
+                            {color_dot} {name}
+                        </div>
+                        <div style="font-weight:700;font-size:1.6rem;color:#1e293b;line-height:1.3;">
+                            {val_str}
+                        </div>
+                        <div style="font-size:0.78rem;color:{bank_color};font-weight:600;">
+                            {bank_text}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+            else:
+                st.metric(label=f"{color_dot} {name}", value=t['sensor_offline'])
 
-    pipecard(p1, "Sadao", t['sadao_unit'], sadao_v, dot(sadao_v))
+    pipecard(p1, "Sadao", sadao_info, dot(sadao_v, 'Sadao'), 'Sadao')
     
     with a1:
-        st.markdown(f"<div style='text-align:center;padding-top:28px;color:#cbd5e1;font-size:2rem;font-weight:800;'>➔</div>", unsafe_allow_html=True)
-        # st.caption(f"~{int(eta_hrs * 0.4)}h") # Removed for cleaner look
+        st.markdown(f"<div style='text-align:center;padding-top:28px;color:#cbd5e1;font-size:2rem;font-weight:800;'>\u27a1</div>", unsafe_allow_html=True)
 
-    pipecard(p2, "Bang Sala", "Bang Sala (X.44)", kalla_v, dot(kalla_v))
+    pipecard(p2, "Bang Sala", kalla_info, dot(kalla_v, 'Kallayanamit'), 'Kallayanamit')
     
     with a2:
-        st.markdown(f"<div style='text-align:center;padding-top:28px;color:#cbd5e1;font-size:2rem;font-weight:800;'>➔</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='text-align:center;padding-top:28px;color:#cbd5e1;font-size:2rem;font-weight:800;'>\u27a1</div>", unsafe_allow_html=True)
 
-    pipecard(p3, "Hatyai", t['hatyai_unit'], hatyai_v, dot(hatyai_v))
+    pipecard(p3, "Hatyai", hatyai_info, dot(hatyai_v, 'HatYai'), 'HatYai')
 
     # ==========================================================
     # SECTION 3: METRIC CARDS
@@ -604,8 +712,24 @@ def main():
         val = clean_value(sensor_data.get('level'))
         delta = roc.get(sensor_data.get('station_name'), 0)
         
+        # Show water depth for HatYai (primary station)
+        hy_info = hatyai_info
+        if hy_info['depth'] is not None:
+            depth = hy_info['depth']
+            ltb = hy_info['left_to_bank']
+            if hy_info['overtopping']:
+                bank_text = f"น้ำล้นตลิ่ง {ltb:.1f}ม." if lang == 'th' else f"Over bank {ltb:.1f}m"
+                bank_color = '#ef4444'
+            else:
+                bank_text = f"อีก {ltb:.1f} ม. จะล้นตลิ่ง" if lang == 'th' else f"{ltb:.1f}m to bank"
+                bank_color = '#22c55e' if ltb > 3 else ('#eab308' if ltb > 1 else '#ef4444')
+        else:
+            depth = None
+            bank_text = ''
+            bank_color = '#64748b'
+        
         # Dynamic Color Logic
-        val_color = "var(--text)"
+        val_color = "#1e293b"
         if val is not None:
             if val > CRITICAL_LEVEL: val_color = "#ef4444"
             elif val > WARNING_LEVEL: val_color = "#eab308"
@@ -613,13 +737,16 @@ def main():
         st.markdown(
             f"""
             <div style="background:white;border:1px solid #e2e8f0;border-radius:12px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.04);transition:all 0.3s ease;">
-                <label style="color:#64748b;font-weight:600;text-transform:uppercase;font-size:0.78rem;letter-spacing:0.05em;" title="{t['hatyai_unit']}">
-                    📍 {t['hatyai_card']}
-                </label>
-                <div style="color:{val_color};font-weight:700;font-size:1.8rem;line-height:1.4;">
-                    {fmt(val)} <span style="font-size:1rem;color:#64748b;">m</span>
+                <div style="font-weight:800;font-size:1.05rem;color:#0f172a;margin-bottom:4px;" title="{t['hatyai_unit']}">
+                    \U0001f4cd {t['hatyai_card']}
                 </div>
-                <div style="font-size:0.9rem;color:{'#ef4444' if delta > 0 else '#22c55e'};font-weight:500;">
+                <div style="color:{val_color};font-weight:700;font-size:1.8rem;line-height:1.4;">
+                    {f'{depth:.1f}' if depth is not None else '\u2014'} <span style="font-size:1rem;color:#64748b;">m</span>
+                </div>
+                <div style="font-size:0.78rem;color:{bank_color};font-weight:600;">
+                    {bank_text}
+                </div>
+                <div style="font-size:0.85rem;color:{'#ef4444' if delta > 0 else '#22c55e'};font-weight:500;">
                     {delta:+.2f} m/h
                 </div>
             </div>
@@ -628,10 +755,38 @@ def main():
         )
 
     with c3:
-        st.metric(
-            label=f"🔼 {t['sadao_card']}",
-            value=f"{fmt(sadao_v)} m" if sadao_v is not None else t['sensor_offline'],
-            help=t['sadao_unit']
+        # Show Sadao depth + bank distance
+        sa_info = sadao_info
+        if sa_info['depth'] is not None:
+            sa_depth = sa_info['depth']
+            sa_ltb = sa_info['left_to_bank']
+            if sa_info['overtopping']:
+                sa_bank_text = f"น้ำล้นตลิ่ง {sa_ltb:.1f}ม." if lang == 'th' else f"Over bank {sa_ltb:.1f}m"
+                sa_bank_color = '#ef4444'
+            else:
+                sa_bank_text = f"อีก {sa_ltb:.1f} ม. จะล้นตลิ่ง" if lang == 'th' else f"{sa_ltb:.1f}m to bank"
+                sa_bank_color = '#22c55e' if sa_ltb > 3 else ('#eab308' if sa_ltb > 1 else '#ef4444')
+            sa_val = f"{sa_depth:.1f} m"
+        else:
+            sa_val = t['sensor_offline']
+            sa_bank_text = ''
+            sa_bank_color = '#64748b'
+        
+        st.markdown(
+            f"""
+            <div style="background:white;border:1px solid #e2e8f0;border-radius:12px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.04);">
+                <div style="font-weight:800;font-size:1.05rem;color:#0f172a;margin-bottom:4px;">
+                    \U0001f53c {t['sadao_card']}
+                </div>
+                <div style="font-weight:700;font-size:1.8rem;color:#1e293b;line-height:1.4;">
+                    {sa_val}
+                </div>
+                <div style="font-size:0.78rem;color:{sa_bank_color};font-weight:600;">
+                    {sa_bank_text}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
         )
 
     with c4:
@@ -815,6 +970,99 @@ def main():
             legend=dict(orientation="h", y=1.08, font=dict(color='#1e293b'))
         )
         st.plotly_chart(fig_water, use_container_width=True)
+
+    # ==========================================================
+    # SECTION: HYBRID INTELLIGENCE (Local News + Sensor Health)
+    # ==========================================================
+    st.markdown("---")
+    
+    section_title = "🌐 ข่าวสารและสถานะจากศูนย์หาดใหญ่" if st.session_state.lang == "TH" else "🌐 Local Intelligence (HatyaiCityClimate)"
+    st.markdown(f"### {section_title}")
+    
+    if not local_intel.get('success'):
+        err = local_intel.get('error', 'Unknown')
+        st.warning(f"⚠️ ไม่สามารถเชื่อมต่อ hatyaicityclimate.org ได้: {err}")
+    else:
+        col_news, col_health = st.columns([3, 2], gap="large")
+        
+        with col_news:
+            news_title = "📢 ประกาศล่าสุด" if st.session_state.lang == "TH" else "📢 Latest Announcements"
+            st.markdown(f"#### {news_title}")
+            
+            news_items = local_intel.get('news', [])
+            if news_items:
+                for i, news in enumerate(news_items[:5]):
+                    is_alert = news.get('is_alert', False)
+                    icon = "🚨" if is_alert else "📰"
+                    border_color = "#ef4444" if is_alert else "#3b82f6"
+                    
+                    st.markdown(
+                        f"""
+                        <a href="{news['link']}" target="_blank" style="text-decoration:none;">
+                            <div style="background:white;border:1px solid #e2e8f0;border-left:4px solid {border_color};
+                                        border-radius:8px;padding:12px 16px;margin-bottom:8px;
+                                        transition:all 0.2s ease;cursor:pointer;">
+                                <span style="color:#1e293b;font-size:0.95rem;">
+                                    {icon} {news['title']}
+                                </span>
+                            </div>
+                        </a>
+                        """,
+                        unsafe_allow_html=True
+                    )
+            else:
+                no_news = "✅ ยังไม่มีประกาศเตือนภัยใหม่" if st.session_state.lang == "TH" else "✅ No new alerts"
+                st.success(no_news)
+        
+        with col_health:
+            health_title = "🛠️ สถานะเซนเซอร์" if st.session_state.lang == "TH" else "🛠️ Sensor Health"
+            st.markdown(f"#### {health_title}")
+            
+            station_health = local_intel.get('station_health', {})
+            for station, status in station_health.items():
+                if status == "online":
+                    icon = "🟢"
+                    color = "#22c55e"
+                    label = "ปกติ" if st.session_state.lang == "TH" else "Online"
+                else:
+                    icon = "🔴"
+                    color = "#ef4444"
+                    label = "ขัดข้อง" if st.session_state.lang == "TH" else "Outage"
+                
+                detail = local_intel.get('outage_details', {}).get(station, '')
+                
+                st.markdown(
+                    f"""
+                    <div style="background:white;border:1px solid #e2e8f0;border-radius:8px;
+                                padding:10px 14px;margin-bottom:6px;display:flex;
+                                justify-content:space-between;align-items:center;">
+                        <span style="font-weight:600;color:#1e293b;">{icon} {station}</span>
+                        <span style="color:{color};font-weight:700;font-size:0.85rem;
+                                     background:{'#fee2e2' if status != 'online' else '#dcfce7'};
+                                     padding:2px 10px;border-radius:20px;">
+                            {label}
+                        </span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                if detail and status != "online":
+                    st.caption(f"📋 {detail[:80]}")
+            
+            # Camera count
+            cam_count = len(local_intel.get('cameras', []))
+            if cam_count > 0:
+                cam_label = f"📷 กล้อง CCTV ที่ตรวจพบ: **{cam_count} จุด**" if st.session_state.lang == "TH" else f"📷 CCTV cameras detected: **{cam_count} feeds**"
+                st.markdown(f"\n{cam_label}")
+        
+        # Source attribution
+        st.caption(
+            f"ℹ️ ข้อมูลจาก [hatyaicityclimate.org]({local_intel.get('source_url', 'https://www.hatyaicityclimate.org')}) "
+            f"• ดึงเมื่อ {local_intel.get('scrape_time', datetime.now()).strftime('%H:%M')}"
+            if st.session_state.lang == "TH" else
+            f"ℹ️ Source: [hatyaicityclimate.org]({local_intel.get('source_url', 'https://www.hatyaicityclimate.org')}) "
+            f"• Fetched at {local_intel.get('scrape_time', datetime.now()).strftime('%H:%M')}"
+        )
 
     # ==========================================================
     # FOOTER

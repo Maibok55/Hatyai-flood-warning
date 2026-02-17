@@ -12,25 +12,35 @@ from datetime import timedelta
 
 # Station Information
 STATION_METADATA = {
+    # ⚠️ IDs verified via ThaiWater API geocode on 2026-02-17
+    # Thresholds from API field: station.min_bank (real bank elevation MSL)
     "HatYai": {
-        "id": 2585,
+        "id": 2590,                    # Was 2585 (SWAPPED - geocode confirmed)
         "code": "X.90",
         "name": "Hat Yai City",
-        "location": "Economic Zone",
-        "bank_full_capacity": 10.5,  # meters MSL
-        "critical_threshold": 11.0,   # meters MSL
-        "min_valid_level": -2.0,      # meters MSL (dry season)
+        "location": "Economic Zone (Downstream)",
+        "bank_full_capacity": 8.88,    # min_bank from API (MSL)
+        "warning_threshold": 7.38,     # bank - 1.5m (early warning)
+        "critical_threshold": 8.88,    # = min_bank (bank overflow)
+        "ground_level": 0.0,           # from API station.ground_level
+        "min_valid_level": -0.5,       # slightly below ground
+        "left_bank": 8.88,             # from API
+        "right_bank": 8.88,            # from API
         "lat": 7.0084,
         "lon": 100.4767
     },
     "Sadao": {
-        "id": 2590,
+        "id": 2585,                    # Was 2590 (SWAPPED - geocode confirmed)
         "code": "X.173", 
         "name": "Sadao",
         "location": "Upstream Station",
-        "bank_full_capacity": 9.0,    # meters MSL
-        "critical_threshold": 9.5,     # meters MSL
-        "min_valid_level": -1.5,      # meters MSL
+        "bank_full_capacity": 16.13,   # min_bank from API (MSL)
+        "warning_threshold": 14.63,    # bank - 1.5m
+        "critical_threshold": 16.13,   # = min_bank
+        "ground_level": 3.748,         # from API
+        "min_valid_level": 3.0,        # slightly below ground
+        "left_bank": 16.955,           # from API
+        "right_bank": 16.944,          # from API
         "lat": 6.8500,
         "lon": 100.4200
     },
@@ -39,9 +49,13 @@ STATION_METADATA = {
         "code": "X.44",
         "name": "Bang Sala",
         "location": "Midstream Strategic Point",
-        "bank_full_capacity": 10.0,    # meters MSL
-        "critical_threshold": 10.5,   # meters MSL
-        "min_valid_level": -1.8,      # meters MSL
+        "bank_full_capacity": 9.34,    # min_bank from API (MSL)
+        "warning_threshold": 7.84,     # bank - 1.5m
+        "critical_threshold": 9.34,    # = min_bank
+        "ground_level": -0.881,        # from API
+        "min_valid_level": -1.5,       # slightly below ground
+        "left_bank": 11.247,           # from API
+        "right_bank": 11.25,           # from API
         "lat": 6.9500,
         "lon": 100.4500
     }
@@ -160,11 +174,6 @@ API_CONFIG = {
         "url": "https://api-v3.thaiwater.net/api/v1/thaiwater30/public/waterlevel_load",
         "timeout": 5,
         "cache_minutes": 15
-    },
-    "rid": {
-        "url": "http://119.110.213.190/rid/stations.php?IdCode=08:STN04",
-        "timeout": 10,
-        "cache_minutes": 10
     },
     "openmeteo": {
         "url": "https://api.open-meteo.com/v1/forecast",

@@ -158,7 +158,8 @@ class FloodPredictor:
             "station_name": None,
             "timestamp": None,
             "is_fallback": True,
-            "all_data": {}
+            "all_data": {},
+            "bank_info": {}  # NEW: per-station bank data from API
         }
 
         conn = sqlite3.connect(self.db_path)
@@ -254,6 +255,15 @@ class FloodPredictor:
                         station_name = station_mapping[station_id]
                         raw_val = entry.get('waterlevel_msl') or entry.get('waterlevel') or entry.get('value')
                         val_float = clean_value(raw_val, station_name)
+                        
+                        # Capture dynamic bank data from API
+                        diff_wl_bank = entry.get('diff_wl_bank')
+                        result["bank_info"][station_name] = {
+                            "diff_wl_bank": float(diff_wl_bank) if diff_wl_bank is not None else None,
+                            "min_bank": float(st_info.get('min_bank')) if st_info.get('min_bank') is not None else None,
+                            "situation_level": entry.get('situation_level'),
+                            "ground_level": st_info.get('ground_level'),
+                        }
                         
                         if val_float is not None:
                             timestamp_str = entry.get('waterlevel_datetime') or entry.get('datetime')
@@ -373,31 +383,60 @@ class FloodPredictor:
         """
         rain_sum = rain_data.get("rain_sum_3d", 0.0)
         current_level = sensor_data.get("level")
+        station_name = sensor_data.get("station_name", "HatYai")
+        
+        # Get station-specific thresholds
+        station_meta = STATION_METADATA.get(station_name, STATION_METADATA['HatYai'])
+        warning_threshold = station_meta.get('warning_threshold', station_meta['bank_full_capacity'] - 1.5)
+        critical_threshold = station_meta.get('critical_threshold', station_meta['bank_full_capacity'])
         
         # 1. Calculate Rain Risk (0-100%)
         rain_risk_pc = min((rain_sum / RAINFALL_THRESHOLDS['catastrophic_24h']) * 100, 100)
         
-        # 2. Calculate Water Level Risk using Sigmoid Function
+        # 2. Calculate Water Level Risk (piecewise: low risk below warning, steep above)
         if current_level is not None:
-            water_risk_pc = sigmoid_risk(
-                current_level, 
-                RISK_CALCULATION['sigmoid_k'], 
-                RISK_CALCULATION['sigmoid_x0']
-            )
+            ground = station_meta.get('ground_level', 0)
+            bank = station_meta['bank_full_capacity']
+            
+            if current_level <= ground:
+                water_risk_pc = 0.0
+            elif current_level < warning_threshold:
+                # Normal zone: ground → warning = 0% → 15% risk (gentle slope)
+                normal_range = warning_threshold - ground
+                if normal_range > 0:
+                    ratio = (current_level - ground) / normal_range
+                    water_risk_pc = ratio * 15.0  # Max 15% in normal zone
+                else:
+                    water_risk_pc = 0.0
+            elif current_level < critical_threshold:
+                # Danger zone: warning → critical = 15% → 75% risk (steep)
+                danger_range = critical_threshold - warning_threshold
+                if danger_range > 0:
+                    ratio = (current_level - warning_threshold) / danger_range
+                    water_risk_pc = 15.0 + ratio * 60.0  # 15% → 75%
+                else:
+                    water_risk_pc = 75.0
+            else:
+                # Overtopping zone: above critical = 75% → 100%
+                over = current_level - critical_threshold
+                water_risk_pc = min(100, 75.0 + over * 25.0)  # +25% per meter over
         else:
             water_risk_pc = 0.0
         
-        # 3. Combined Risk Assessment (Smooth Weighted Average)
+        # 3. Combined Risk (Safety-First: MAX when above warning)
         if current_level is not None:
-            # Use weighted average for smooth transitions
-            final_risk = (
-                rain_risk_pc * RISK_CALCULATION['rainfall_weight'] + 
-                water_risk_pc * RISK_CALCULATION['water_level_weight']
-            )
+            if current_level >= warning_threshold:
+                # Safety override: water is near/above bank - take maximum
+                final_risk = max(rain_risk_pc, water_risk_pc)
+            else:
+                # Normal: weighted average
+                final_risk = (
+                    rain_risk_pc * RISK_CALCULATION['rainfall_weight'] + 
+                    water_risk_pc * RISK_CALCULATION['water_level_weight']
+                )
             confidence = 90
             source = f"Hybrid ({sensor_data.get('station_code')})"
         else:
-            # No sensor data - rely on rain only
             final_risk = rain_risk_pc
             confidence = 65
             source = "Virtual (Rain Only)"
@@ -583,21 +622,25 @@ class FloodPredictor:
         # 3. Upstream Analysis
         all_d = sensor_data.get('all_data', {})
         sadao = all_d.get('Sadao')
+        sadao_meta = STATION_METADATA['Sadao']
+        sadao_warning = sadao_meta.get('warning_threshold', sadao_meta['bank_full_capacity'] - 1.5)
+        
         if sadao is None:
             up_th = "ไม่สามารถอ่านค่าระดับน้ำต้นน้ำ (สะเดา) ได้"
             up_en = "Upstream sensor (Sadao) offline."
-        elif sadao < 9.0:
-            # Normal condition - reassure user
-            up_th = f"ระดับน้ำสะเดาปกติ ({sadao:.2f} ม.) การไหลระบายดี"
-            up_en = f"Upstream flow normal at Sadao ({sadao:.2f} m). Good drainage."
+        elif sadao < sadao_warning:
+            # Normal condition - use bank ratio for context
+            bank_ratio = (sadao / sadao_meta['bank_full_capacity']) * 100
+            up_th = f"ระดับน้ำสะเดาปกติ ({sadao:.2f} ม. MSL, {bank_ratio:.0f}% ของตลิ่ง)"
+            up_en = f"Upstream normal at Sadao ({sadao:.2f}m MSL, {bank_ratio:.0f}% bank capacity)."
         else:
             # Critical condition - warn user
             eta_h = eta.get('eta_hours', 20)
-            up_th = f"⚠️ มวลน้ำก้อนใหญ่จากสะเดา ({sadao:.2f} ม.) จะถึงเมืองใน {int(eta_h)} ชม."
-            up_en = f"⚠️ CRITICAL: High water mass from Sadao ({sadao:.2f} m) arriving in {int(eta_h)} hrs."
+            up_th = f"\u26a0\ufe0f มวลน้ำก้อนใหญ่จากสะเดา ({sadao:.2f} ม.) จะถึงเมืองใน {int(eta_h)} ชม."
+            up_en = f"\u26a0\ufe0f CRITICAL: High water from Sadao ({sadao:.2f}m) arriving in {int(eta_h)} hrs."
             
         # 4. Action
-        if risk_score > 70 or (sadao is not None and sadao > 9.0):
+        if risk_score > 70 or (sadao is not None and sadao > sadao_warning):
             act_th = "ยกของขึ้นที่สูงและเตรียมย้ายรถทันที"
             act_en = "Move assets to high ground immediately."
         elif risk_score > 30:
