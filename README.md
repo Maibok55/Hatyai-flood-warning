@@ -57,7 +57,7 @@ source venv/bin/activate
 ```bash
 pip install -r requirements.txt
 ```
-*(ตัวอย่างไลบรารีที่จำเป็น: `streamlit`, `pandas`, `plotly`, `folium`, `streamlit-folium`, `requests`, `beautifulsoup4`)*
+*(ตัวอย่างไลบรารีที่จำเป็น: `streamlit`, `plotly`, `folium`, `streamlit-folium`, `requests`, `beautifulsoup4`)*
 
 **4. รันแอปพลิเคชัน Streamlit**
 ```bash

@@ -1,0 +1,26 @@
+{
+  "thaiwater": {
+    "source": "thaiwater",
+    "endpoint": "https://api-v3.thaiwater.net/api/v1/thaiwater30/public/waterlevel_load",
+    "station_ids": [
+      "2590",
+      "2585",
+      "2589"
+    ],
+    "fetched_utc": "2026-02-28T16:14:46Z",
+    "status": "ok",
+    "fingerprint": "faa0f43edd39b38b",
+    "raw_file": "thaiwater_20260228T161446Z.json"
+  },
+  "openmeteo": {
+    "source": "openmeteo",
+    "endpoint": "https://api.open-meteo.com/v1/forecast",
+    "station_ids": [
+      "7.0084,100.4767"
+    ],
+    "fetched_utc": "2026-02-28T16:14:47Z",
+    "status": "ok",
+    "fingerprint": "a32b69a6feec1918",
+    "raw_file": "openmeteo_20260228T161447Z.json"
+  }
+}
