@@ -1,0 +1,26 @@
+# Python environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Streamlit config
+.streamlit/
+
+# Database files
+*.sqlite3
+*.db
+flood_data.db
+
+# Raw data and logs
+data/raw/*.json
+
+# Logs
+logs/
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
