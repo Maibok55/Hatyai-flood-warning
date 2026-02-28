@@ -12,6 +12,7 @@ from constants import (
     SYSTEM_CONFIG, calculate_flow_velocity, sigmoid_risk,
     calculate_eta_hours, calculate_actual_distance
 )
+from models.ingest import write_provenance, cleanup_raw
 
 # =============================================================
 # UTILITY: Error Shielding Decorator
@@ -166,13 +167,12 @@ class FloodPredictor:
         cursor = conn.cursor()
         
         try:
-            # Atomic check for recent data
-            cursor.execute("""
-                SELECT timestamp, station_id, level 
-                FROM water_levels 
-                WHERE timestamp >= datetime('now', '-{} minutes')
-                ORDER BY timestamp DESC
-            """.format(cache_minutes))
+            # Atomic check for recent data (parameterized to prevent SQL injection)
+            cutoff = (get_bangkok_time() - timedelta(minutes=cache_minutes)).strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute(
+                "SELECT timestamp, station_id, level FROM water_levels WHERE timestamp >= ? ORDER BY timestamp DESC",
+                (cutoff,)
+            )
             rows = cursor.fetchall()
             
             if rows:
@@ -200,6 +200,15 @@ class FloodPredictor:
                     result["station_name"] = "Sadao"
                     result["is_fallback"] = True
                 
+                # Record provenance (cached)
+                write_provenance(
+                    source="thaiwater",
+                    endpoint=api_config['url'],
+                    station_ids=[str(m['id']) for m in STATION_METADATA.values()],
+                    payload=None,
+                    status="cached",
+                    extra={"cache_timestamp": latest_ts_str}
+                )
                 print(f"[INFO] Using cached DB data from {latest_ts_str}")
                 return result
                 
@@ -218,6 +227,16 @@ class FloodPredictor:
             
             if response.status_code == 200:
                 data = response.json()
+                
+                # Record provenance (fresh API call)
+                write_provenance(
+                    source="thaiwater",
+                    endpoint=api_config['url'],
+                    station_ids=[str(m['id']) for m in STATION_METADATA.values()],
+                    payload=data,
+                    status="ok"
+                )
+                cleanup_raw("thaiwater", keep_last=48)
                 
                 # Navigate API structure
                 entries = []
@@ -295,6 +314,13 @@ class FloodPredictor:
                     conn.close()
                     
             else:
+                write_provenance(
+                    source="thaiwater",
+                    endpoint=api_config['url'],
+                    station_ids=[str(m['id']) for m in STATION_METADATA.values()],
+                    payload=None,
+                    status=f"error_{response.status_code}"
+                )
                 print(f"[ERROR] API returned {response.status_code}")
                 
         except Exception as e:
@@ -328,6 +354,16 @@ class FloodPredictor:
             
             if response.status_code == 200:
                 data = response.json()
+                
+                # Record rain provenance
+                write_provenance(
+                    source="openmeteo",
+                    endpoint=api_config['url'],
+                    station_ids=f"{hatyai_coords['lat']},{hatyai_coords['lon']}",
+                    payload=data,
+                    status="ok"
+                )
+                cleanup_raw("openmeteo", keep_last=24)
                 daily = data.get("daily", {})
                 hourly = data.get("hourly", {})
                 
