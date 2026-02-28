@@ -15,17 +15,17 @@ STATION_METADATA = {
     # ⚠️ IDs verified via ThaiWater API geocode on 2026-02-17
     # Thresholds from API field: station.min_bank (real bank elevation MSL)
     "HatYai": {
-        "id": 2590,                    # Was 2585 (SWAPPED - geocode confirmed)
-        "code": "X.90",
+        "id": 2590,
+        "code": "X.44",               # X.44 = บ้านหาดใหญ่ใน (RID official)
         "name": "Hat Yai City",
         "location": "Economic Zone (Downstream)",
-        "bank_full_capacity": 8.88,    # min_bank from API (MSL)
-        "warning_threshold": 7.38,     # bank - 1.5m (early warning)
-        "critical_threshold": 8.88,    # = min_bank (bank overflow)
+        "bank_full_capacity": 7.40,    # Official bank level (RID/ONWR) — ม.รทก.
+        "warning_threshold": 5.90,     # bank - 1.5m (early warning)
+        "critical_threshold": 7.40,    # = bank level (overflow point)
         "ground_level": 0.0,           # from API station.ground_level
         "min_valid_level": -0.5,       # slightly below ground
-        "left_bank": 8.88,             # from API
-        "right_bank": 8.88,            # from API
+        "left_bank": 7.40,             # official RID value
+        "right_bank": 7.40,            # official RID value
         "lat": 7.0084,
         "lon": 100.4767
     },
@@ -46,16 +46,16 @@ STATION_METADATA = {
     },
     "Kallayanamit": {
         "id": 2589,
-        "code": "X.44",
+        "code": "X.90",               # X.90 = บ้านบางศาลา อ.คลองหอยโข่ง (RID official)
         "name": "Bang Sala",
         "location": "Midstream Strategic Point",
-        "bank_full_capacity": 9.34,    # min_bank from API (MSL)
+        "bank_full_capacity": 9.34,    # Official bank level (RID/ONWR) — ม.รทก.
         "warning_threshold": 7.84,     # bank - 1.5m
-        "critical_threshold": 9.34,    # = min_bank
+        "critical_threshold": 9.34,    # = bank level (overflow point)
         "ground_level": -0.881,        # from API
         "min_valid_level": -1.5,       # slightly below ground
-        "left_bank": 11.247,           # from API
-        "right_bank": 11.25,           # from API
+        "left_bank": 9.34,             # official RID value
+        "right_bank": 9.34,            # official RID value
         "lat": 6.9500,
         "lon": 100.4500
     }

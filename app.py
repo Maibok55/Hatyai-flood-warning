@@ -1,10 +1,17 @@
-import streamlit as st
-import pandas as pd
+﻿import streamlit as st
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+import folium
+from streamlit_folium import st_folium
+import requests
+from datetime import datetime
 from models.flood_predictor import FloodPredictor, clean_value, get_bangkok_time
+from models.ingest import read_provenance
+from models.qa import compute_qa_flags, qa_badge
 from constants import EMERGENCY_CONTACTS, EVACUATION_ZONES, STATION_METADATA
 from hatyai_scraper import scrape_hatyai_climate, check_zombie_data
+from utils import fmt, dot, icon_b64, CRITICAL_LEVEL, WARNING_LEVEL
+from ui.components import render_sidebar, render_action_banner, render_qa_strip, render_zombie_warning
+from ui import render_hero, render_pipeline, render_footer, render_inline_qa_badges
 
 # =============================================================
 # 1. PAGE CONFIG
@@ -17,257 +24,66 @@ st.set_page_config(
 )
 
 # =============================================================
-# 2. TRANSLATIONS (Enhanced with Emergency Messages)
+# 2. TRANSLATIONS — loaded from locales/{en,th}.json
 # =============================================================
-TRANSLATIONS = {
-    "EN": {
-        "title": "HYFI Intelligence",
-        "subtitle": "Real-time Crisis Monitoring • U-Tapao Basin",
-        "last_update": "Last Updated",
-        "refresh_btn": "Refresh Data",
-        "settings": "Settings",
-        "token_label": "Line Notify Token",
-        "test_btn": "Test Alert",
-        "test_msg": "🔔 Test Alert from HYFI",
-        "sent": "Alert Sent",
-        "no_token": "Token Required",
-        "guide_title": "Instructions",
-        "guide_text": """
-**How to use:**
-1. **Line Notify**: Get your token from [notify-bot.line.me](https://notify-bot.line.me/).
-2. **Thresholds**:
-   - 🟢 Normal: < 9.0 m
-   - ⚠️ Warning: 9.0 - 10.5 m
-   - 🚨 Critical: > 10.5 m
-        """,
-        "risk_title": "Risk Assessment",
-        "confidence": "Confidence",
-        "source": "Source",
-        "checklist_title": "Recommended Actions",
-        "eta_title": "Estimated Travel Time",
-        "eta_from": "Sadao → Hatyai City",
-        "eta_speed": "Flow Velocity",
-        "eta_conf": "Est. Accuracy",
-        "outlook_title": "3-Day Forecast",
-        "trend": "Trend",
-        "peak_day": "Peak Interval",
-        "history_title": "Historical Context",
-        "rain_card": "Rain Accumulation",
-        "rain_unit": "3-Day Total",
-        "hatyai_card": "Hatyai Level",
-        "hatyai_unit": "Station X.44 • Economic Zone Watch",
-        "sadao_card": "Upstream Level",
-        "sadao_unit": "Sadao (X.173) • Early warning 15-20 hrs",
-        "forecast_card": "AI Prediction",
-        "forecast_unit": "+3 Hour Model",
-        "chart_water": "Water Level Analysis (24h)",
-        "chart_rain_hourly": "Precipitation Intensity (Next 24h)",
-        "pipeline_title": "Water Level (m)",
-        "sensor_offline": "Offline",
-        "processing": "Analyzing...",
-        "about_title": "ℹ️ About This System",
-        "about_text": """
-**Welcome to HYFI**, an intelligent flood risk analysis system for the U-Tapao Canal Basin and Hatyai Municipality.
+import json as _json
+import os as _os
 
-**📡 1. How the System Works**
-HYFI utilizes **Hybrid Intelligence** to calculate flood risks:
-- **Live Local Sensors**: Real-time water level data from Hatyai Municipality (X.44, X.90, X.173).
-- **Global Rain Model**: 3-day accumulated rainfall forecasts from **Open-Meteo API**.
-- **Automatic Virtual Mode**: If sensors fail, the system switches to use global rainfall data exclusively.
-- **Advanced Hydraulic Logic**: River sinuosity factor and flow velocity calculations for accurate ETA.
+_LOCALE_DIR = _os.path.join(_os.path.dirname(__file__), "locales")
 
-**📍 2. Coverage Area**
-- **Upstream (Sadao)**: Station X.173 - Monitoring water from the south.
-- **Midstream (Bang Sala)**: Station X.44 - Strategic point for predicting urban inflow.
-- **Downstream (Hatyai City)**: Station X.90 - Economic zone levels.
+@st.cache_data
+def _load_translations():
+    out = {}
+    for code, filename in [("EN", "en.json"), ("TH", "th.json")]:
+        path = _os.path.join(_LOCALE_DIR, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                out[code] = _json.load(f)
+        except Exception as e:
+            st.error(f"Locale load error ({filename}): {e}")
+            out[code] = {}
+    return out
 
-**🚦 3. Understanding the Risk Gauge**
-- 🟢 **0-30% (Normal)**: Good weather. Drainage normal.
-- 🟡 **31-70% (Watch)**: Rising accumulation. Monitor updates.
-- 🔴 **71-100% (Critical)**: High flood risk. Immediate action recommended.
-
-**✅ 4. Action Checklist**
-- **Green**: Stay informed, check drains.
-- **Yellow**: Move belongings up, check fuel/batteries.
-- **Red**: Move vehicles to safe zones (e.g., PSU Pumpkin Bldg), cut ground-floor power.
-
-**🆘 5. Emergency Response**
-- **Critical Mode**: Automatic display of emergency contacts and evacuation routes.
-- **Real-time ETA**: Advanced hydraulic calculations for water arrival time.
-- **Historical Context**: Comparison with 2010 Great Flood benchmark.
-
-**⚠️ Disclaimer & Privacy**
-Data is based on statistical models and hydraulic principles. Please use as a guide alongside official municipal announcements.
-*Developed by ICT Students, Faculty of Science, PSU.*
-        """,
-    },
-    "TH": {
-        "title": "HYFI Intelligence",
-        "subtitle": "ระบบเฝ้าระวังวิกฤตการณ์น้ำ • ลุ่มน้ำคลองอู่ตะเภา",
-        "last_update": "อัปเดตล่าสุด",
-        "refresh_btn": "รีเฟรชข้อมูล",
-        "settings": "ตั้งค่าการแจ้งเตือน",
-        "token_label": "Line Notify Token",
-        "test_btn": "ทดสอบระบบ",
-        "test_msg": "🔔 ทดสอบการแจ้งเตือน HYFI",
-        "sent": "ส่งข้อความแล้ว",
-        "no_token": "กรุณาระบุ Token",
-        "guide_title": "คู่มือการใช้งาน",
-        "guide_text": """
-**วิธีใช้งาน:**
-1. **Line Notify**: ขอ Token ได้ที่ [notify-bot.line.me](https://notify-bot.line.me/)
-2. **เกณฑ์ระดับน้ำ**:
-   - 🟢 ปกติ: < 9.0 ม.
-   - ⚠️ เฝ้าระวัง: 9.0 - 10.5 ม.
-   - 🚨 วิกฤต: > 10.5 ม.
-        """,
-        "risk_title": "ประเมินความเสี่ยง",
-        "confidence": "ความเชื่อมั่น",
-        "source": "แหล่งข้อมูล",
-        "checklist_title": "ข้อแนะนำการปฏิบัติ",
-        "eta_title": "ระยะเวลาเดินทางของน้ำ (โดยประมาณ)",
-        "eta_from": "อ.สะเดา → นครหาดใหญ่",
-        "eta_speed": "ความเร็วกระแสน้ำ",
-        "eta_conf": "ความแม่นยำ",
-        "outlook_title": "แนวโน้ม 3 วันล่วงหน้า",
-        "trend": "ทิศทาง",
-        "peak_day": "ช่วงฝนสูงสุด",
-        "history_title": "เปรียบเทียบเหตุการณ์ในอดีต",
-        "rain_card": "ฝนสะสม",
-        "rain_unit": "รวม 3 วัน",
-        "hatyai_card": "ระดับน้ำหาดใหญ่",
-        "hatyai_unit": "สถานี X.44 • จุดเฝ้าระวังเขตเมืองเศรษฐกิจ",
-        "sadao_card": "ระดับน้ำต้นน้ำ",
-        "sadao_unit": "อ.สะเดา (X.173) • แจ้งเตือนล่วงหน้า 15-20 ชม.",
-        "forecast_card": "คาดการณ์",
-        "forecast_unit": "+3 ชม.",
-        "chart_water": "ระดับน้ำย้อนหลัง 24 ชม.",
-        "chart_rain_hourly": "ความเข้มข้นฝนรายชั่วโมง (24 ชม.)",
-        "pipeline_title": "ระดับน้ำในคลอง (ม.)",
-        "sensor_offline": "ออฟไลน์",
-        "processing": "กำลังวิเคราะห์...",
-        "about_title": "ℹ️ เกี่ยวกับระบบนี้",
-        "about_text": """
-**ยินดีต้อนรับสู่ HYFI** ระบบวิเคราะห์ความเสี่ยงน้ำท่วมอัจฉริยะสำหรับหาดใหญ่
-
-**📡 1. ระบบนี้ทำงานอย่างไร?**
-เราใช้ **Hybrid Intelligence** ในการคำนวณความเสี่ยง:
-- **ข้อมูลสดจากพื้นที่**: ระดับน้ำจริงจากสถานีเทศบาล (X.44, X.90, X.173)
-- **ข้อมูลพยากรณ์โลก**: ปริมาณฝนสะสม 3 วันจาก **Open-Meteo API**
-- **ระบบสำรองอัตโนมัติ (Virtual Mode)**: หากเซนเซอร์ล่ม ระบบจะใช้ข้อมูลฝนคำนวณแทนทันที
-- **ตรรกะทางไฮดรอลิกขั้นสูง**: ปัจจัยความคดเคี้ยวของแม่น้ำและการคำนวณความเร็วกระแสน้ำสำหรับ ETA ที่แม่นยำ
-
-**📍 2. พื้นที่การติดตาม**
-- **ต้นน้ำ (อ.สะเดา)**: สถานี X.173 - ด่านหน้าทิศใต้
-- **กลางน้ำ (บ้านบางศาลา)**: สถานี X.44 - จุดยุทธศาสตร์แจ้งเตือนเข้าเมือง
-- **ปลายน้ำ (เทศบาลนครหาดใหญ่)**: สถานี X.90 - เขตเศรษฐกิจ
-
-**🚦 3. การอ่านค่าหน้าปัดความเสี่ยง**
-- 🟢 **0-30% (ปกติ)**: อากาศดี ระบายน้ำทัน
-- 🟡 **31-70% (เฝ้าระวัง)**: ฝนเริ่มสะสมสูง ควรติดตามข่าว
-- 🔴 **71-100% (วิกฤต)**: เสี่ยงน้ำท่วมสูง พิจารณาอพยพ/ย้ายรถ
-
-**✅ 4. รายการที่ควรปฏิบัติ**
-- **สีเขียว**: ติดตามข่าว, ดูท่อระบายน้ำ
-- **สีเหลือง**: ยกของขึ้นที่สูง, เช็คระดับน้ำมัน/แบตสำรอง
-- **สีแดง**: ย้ายรถไปที่สูง (เช่น ตึกฟักทอง), ตัดไฟชั้นล่าง
-
-**🆘 5. การตอบสนองฉุกเฉิน**
-- **โหมดวิกฤต**: แสดงข้อมูลติดต่อฉุกเฉินและเส้นทางอพยพอัตโนมัติ
-- **ETA แบบเรียลไทม์**: การคำนวณทางไฮดรอลิกขั้นสูงสำหรับเวลาถึงของน้ำ
-- **บริบททางประวัติศาสตร์**: เปรียบเทียบกับมาตรฐานมหาอุทกภัยปี 2010
-
-**⚠️ หมายเหตุ**
-ผลลัพธ์มาจากการคำนวณทางสถิติและหลักการทางไฮดรอลิก โปรดใช้ประกอบการตัดสินใจควบคู่กับประกาศทางการ
-*พัฒนาโดย นักศึกษา ICT คณะวิทยาศาสตร์ ม.อ.*
-        """,
-    }
-}
+TRANSLATIONS = _load_translations()
 
 # =============================================================
-# 3. CSS INJECTION (Non-intrusive, ID/Class-specific)
+# 3. CSS INJECTION — loaded from static/style.css
 # =============================================================
-CUSTOM_CSS = """
+_CSS_PATH = _os.path.join(_os.path.dirname(__file__), "static", "style.css")
+
+def _css_hash():
+    """Return file mod time as cache buster."""
+    try:
+        return str(_os.path.getmtime(_CSS_PATH))
+    except Exception:
+        return "0"
+
+@st.cache_data
+def _load_css(_hash):
+    try:
+        with open(_CSS_PATH, "r", encoding="utf-8") as f:
+            return f"<style>{f.read()}</style>"
+    except Exception:
+        return ""
+
+_font_fix = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Prompt:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/icon?family=Material+Icons|Material+Icons+Outlined|Material+Icons+Round|Material+Icons+Sharp|Material+Icons+Two+Tone');
+@import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=swap');
 
-:root {
-    --blue: #2563EB;
-    --blue-light: #EFF6FF;
-    --green: #22c55e;
-    --yellow: #eab308;
-    --red: #ef4444;
-    --text: #1e293b;
-    --muted: #64748b;
-    --bg: #F8FAFC;
-    --card: #FFFFFF;
-    --border: #E2E8F0;
+/* Aggressively hide icon text if font fails to load completely */
+[data-testid="stIconMaterial"], 
+[data-testid="stExpanderToggleIcon"],
+.stIcon {
+    color: transparent !important;
 }
-
-html, body, [class*="css"], .stApp {
-    font-family: 'Inter', 'Prompt', sans-serif !important;
-    color: var(--text);
-}
-.stApp { background-color: var(--bg) !important; }
-
-/* Sidebar */
-section[data-testid="stSidebar"] {
-    background-color: white !important;
-    border-right: 1px solid var(--border) !important;
-}
-
-/* Buttons */
-.stButton > button {
-    background-color: var(--blue) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-weight: 600 !important;
-    transition: all 0.2s ease !important;
-}
-.stButton > button:hover {
-    background-color: #1d4ed8 !important;
-    transform: translateY(-1px) !important;
-    box-shadow: 0 4px 12px rgba(37,99,235,0.3) !important;
-}
-
-/* Expanders */
-div[data-testid="stExpander"] details {
-    border: 1px solid var(--border) !important;
-    border-radius: 8px !important;
-    background: white !important;
-}
-
-/* Headings */
-h1 { color: var(--text) !important; font-weight: 800 !important; letter-spacing: -0.5px !important; }
-h2, h3, h4 { color: #334155 !important; font-weight: 700 !important; }
-
-/* Metric overrides */
-div[data-testid="stMetric"] {
-    background: white;
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 16px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
-    transition: all 0.3s ease;
-}
-div[data-testid="stMetric"]:hover {
-    transform: translateY(-3px);
-    box-shadow: 0 8px 16px rgba(0,0,0,0.06);
-}
-div[data-testid="stMetric"] label { color: var(--muted) !important; font-weight: 600 !important; text-transform: uppercase !important; font-size: 0.78rem !important; letter-spacing: 0.05em !important; }
-div[data-testid="stMetric"] div[data-testid="stMetricValue"] { font-weight: 700 !important; }
 </style>
 """
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+st.markdown(_load_css(_css_hash()) + _font_fix, unsafe_allow_html=True)
 
 # =============================================================
 # 4. INITIALIZATION
 # =============================================================
-# Use station-specific thresholds from verified API data
-CRITICAL_LEVEL = STATION_METADATA['HatYai']['critical_threshold']   # 8.88m MSL (bank overflow)
-WARNING_LEVEL  = STATION_METADATA['HatYai']['warning_threshold']    # 7.38m MSL (bank - 1.5m)
-
 # Removed cache_resource to ensure latest code is used
 # @st.cache_resource
 def get_predictor():
@@ -275,23 +91,79 @@ def get_predictor():
 
 predictor = get_predictor()
 
-def fmt(v):
-    """Safe formatting for sensor values that may be None."""
-    return f"{v:.2f}" if v is not None else "—"
+@st.dialog("ℹ️ เกี่ยวกับระบบนี้ (About HYFI Intelligence)")
+def show_about_dialog(lang_key):
+    # Depending on language, show either Thai or English. The user provided exhaustive Thai docs.
+    if lang_key == 'th':
+        st.markdown("""
+**ยินดีต้อนรับสู่ HYFI Intelligence ระบบวิเคราะห์ความเสี่ยงน้ำท่วมอัจฉริยะสำหรับพื้นที่หาดใหญ่**
 
-def dot(v, station_name=None):
-    """Status indicator dot for a sensor value, station-aware."""
-    if v is None: return "⚪"
-    if station_name and station_name in STATION_METADATA:
-        meta = STATION_METADATA[station_name]
-        crit = meta.get('critical_threshold', CRITICAL_LEVEL)
-        warn = meta.get('warning_threshold', WARNING_LEVEL)
+**📡 1. ระบบนี้ทำงานอย่างไร?**
+ระบบของเราประเมินความเสี่ยงโดยผสานข้อมูลหลายแหล่งเข้าด้วยกัน (Hybrid Intelligence) เพื่อความแม่นยำสูงสุด:
+- **ข้อมูลจริงจากพื้นที่:** ดึงข้อมูลระดับน้ำแบบเรียลไทม์จากสถานีวัดน้ำ (X.44, X.90, X.173)
+- **ข้อมูลพยากรณ์ล่วงหน้า:** คาดการณ์ปริมาณฝนสะสมล่วงหน้า 3 วัน โดยอ้างอิงจาก Open-Meteo API
+- **ระบบสำรองอัตโนมัติ (Virtual Mode):** หากเซนเซอร์วัดระดับน้ำในพื้นที่ขัดข้อง ระบบจะสลับไปใช้ข้อมูลปริมาณฝนเพื่อประเมินความเสี่ยงแทนทันที
+- **การประเมินทิศทางน้ำ:** มีการคำนวณความเร็วกระแสน้ำและลักษณะความคดเคี้ยวของคลองอู่ตะเภา เพื่อกะเวลาที่มวลน้ำจะเดินทางมาถึง (ETA) ได้อย่างใกล้เคียงความเป็นจริง
+
+**📍 2. สถานีเฝ้าระวังหลัก**
+- **ต้นน้ำ (อ.สะเดา):** สถานี X.173 - ด่านหน้าคอยรับมวลน้ำจากทางทิศใต้
+- **กลางน้ำ (บ้านบางศาลา):** สถานี X.90 - จุดยุทธศาสตร์สำคัญในการเตือนภัยก่อนมวลน้ำเข้าสู่ตัวเมือง
+- **ปลายน้ำ (เทศบาลนครหาดใหญ่):** สถานี X.44 - เขตพื้นที่เศรษฐกิจและใจกลางเมือง
+
+**🚦 3. การอ่านค่าหน้าปัดความเสี่ยง**
+- 🟢 **0-30% (ปกติ):** สถานการณ์ปลอดภัย การระบายน้ำทำได้ดี
+- 🟡 **31-70% (เฝ้าระวัง):** ฝนเริ่มตกสะสม ควรเริ่มติดตามข่าวสารอย่างใกล้ชิด
+- 🔴 **71-100% (วิกฤต):** เสี่ยงน้ำท่วมสูง ควรเตรียมพร้อมรับมือหรือพิจารณาอพยพ
+
+**🚰 4. เกณฑ์ระดับน้ำ (สำหรับเฝ้าระวัง)**
+- 🟢 **ปกติ:** ต่ำกว่า 5.90 ม. รทก.
+- ⚠️ **เฝ้าระวัง:** 5.90 – 7.40 ม. รทก. (น้ำเริ่มใกล้ตลิ่ง)
+- 🚨 **วิกฤต:** ตั้งแต่ 7.40 ม. รทก. ขึ้นไป (น้ำล้นตลิ่ง)
+
+**✅ 5. ข้อแนะนำในการเตรียมรับมือ**
+- **สถานะสีเขียว:** ติดตามพยากรณ์อากาศและตรวจสอบไม่ให้มีขยะอุดตันท่อระบายน้ำรอบบ้าน
+- **สถานะสีเหลือง:** ขนย้ายสิ่งของขึ้นที่สูง เตรียมแบตเตอรี่สำรอง ไฟฉาย และเช็กสภาพรถยนต์
+- **สถานะสีแดง:** นำรถไปจอดในพื้นที่สูง (เช่น ตึกฟักทอง ม.อ.) สับคัตเอาต์ตัดไฟชั้นล่าง และเตรียมตัวอพยพ
+
+**🆘 6. ฟีเจอร์ช่วยเหลือยามฉุกเฉิน**
+- **โหมดวิกฤต (Critical Mode):** ระบบจะแสดงเบอร์โทรติดต่อฉุกเฉินของหน่วยงานในหาดใหญ่ พร้อมแนะนำเส้นทางอพยพโดยอัตโนมัติ
+- **กะเวลาน้ำมาถึง (Real-time ETA):** ช่วยประเมินระยะเวลาที่มวลน้ำจะเดินทางมาถึงพื้นที่เป้าหมาย
+- **เทียบสถิติในอดีต:** นำสถานการณ์ปัจจุบันไปเทียบกับข้อมูลเหตุการณ์น้ำท่วมใหญ่ (เช่น ปี 2553) เพื่อให้เห็นภาพความรุนแรงได้ชัดเจนขึ้น
+
+⚠️ **หมายเหตุ:** ข้อมูลในระบบนี้มาจากการวิเคราะห์ทางสถิติและแบบจำลองทางอุทกวิทยา โปรดใช้เพื่อประกอบการตัดสินใจควบคู่กับการติดตามประกาศเตือนภัยจากหน่วยงานราชการ
+
+💻 *พัฒนาโดย Mongkhonphat*
+        """)
     else:
-        crit = CRITICAL_LEVEL
-        warn = WARNING_LEVEL
-    if v > crit: return "🔴"
-    if v > warn: return "🟡"
-    return "🟢"
+        # Fallback to English using the existing dictionary or a simplified version
+        st.markdown("""
+**Welcome to HYFI Intelligence — Intelligent Flood Risk Analysis System for Hatyai**
+
+**📡 1. How does it work?**
+Our system uses Hybrid Intelligence to evaluate risks:
+- Live Local Sensors (X.44, X.90, X.173)
+- 3-day Rainfall Forecasts (Open-Meteo)
+- Virtual Flow modeling if sensors fail.
+
+**📍 2. Monitoring Stations**
+- Upstream: Sadao (X.173)
+- Midstream: Bang Sala (X.90)
+- Downstream: Hatyai City (X.44)
+
+**🚦 3. Interpreting the Gauge**
+- 🟢 0-30% (Normal): Safe operations.
+- 🟡 31-70% (Watch): Rising water, stay alert.
+- 🔴 71-100% (Critical): High risk, consider evacuation.
+
+**🚰 4. Water Thresholds (Station X.44)**
+- 🟢 Normal: < 5.90 m MSL
+- ⚠️ Watch: 5.90 – 7.40 m MSL
+- 🚨 Critical: ≥ 7.40 m MSL
+
+⚠️ **Note:** Driven by statistical modeling and hydraulics. Follow official announcements.
+
+💻 *Developed by Mongkhonphat*
+        """)
 
 # =============================================================
 # 5. MAIN APP
@@ -299,40 +171,20 @@ def dot(v, station_name=None):
 def main():
     if 'lang' not in st.session_state:
         st.session_state.lang = "TH"
+    
+    lang_key = st.session_state.lang.lower()
 
     # --- SIDEBAR ---
-    with st.sidebar:
-        st.markdown("### 🌊 HYFI")
-        lang_choice = st.radio("Language / ภาษา", ["ไทย", "English"],
-                               index=0 if st.session_state.lang == "TH" else 1,
-                               horizontal=True)
-        st.session_state.lang = "EN" if lang_choice == "English" else "TH"
-        t = TRANSLATIONS[st.session_state.lang]
-        
-        st.divider()
-        if st.button(t["refresh_btn"], use_container_width=True, type="primary"):
-            st.cache_data.clear()
-            st.rerun()
+    # T update handled by state change, main rerun picks it up at top
+    t = TRANSLATIONS[st.session_state.lang]
+    render_sidebar(t, predictor)
 
-        with st.expander(f"⚙️ {t['settings']}"):
-            line_token = st.text_input(t["token_label"], type="password")
-            if st.button(t["test_btn"]):
-                if line_token:
-                    predictor._send_line_notify(t["test_msg"], line_token)
-                    st.success(t["sent"])
-                else:
-                    st.error(t["no_token"])
-
-        st.markdown("---")
-        st.markdown(f"#### 📖 {t['guide_title']}")
-        st.markdown(t["guide_text"])
-
-    # --- DATA FETCH (cached 5 min to avoid redundant API calls) ---
-    @st.cache_data(ttl=300, show_spinner=False)
+    # --- DATA FETCH (cached 10 min to avoid redundant API calls) ---
+    @st.cache_data(ttl=600, show_spinner=False)
     def _fetch_sensor():
         return predictor.fetch_and_store_data()
     
-    @st.cache_data(ttl=300, show_spinner=False)
+    @st.cache_data(ttl=600, show_spinner=False)
     def _fetch_rain():
         return predictor.fetch_rain_forecast()
     
@@ -341,7 +193,7 @@ def main():
         rain_data = _fetch_rain()
     
     # --- HYBRID INTELLIGENCE: Zombie Data Detection ---
-    @st.cache_data(ttl=300, show_spinner=False)
+    @st.cache_data(ttl=600, show_spinner=False)
     def _fetch_local_intel():
         return scrape_hatyai_climate()
     
@@ -351,173 +203,88 @@ def main():
     if local_intel.get('success') and local_intel.get('outage_stations'):
         sensor_data, zombie_report = check_zombie_data(sensor_data, local_intel)
     
+    # === FAILSAFE: Detect total data loss ===
+    _no_sensor = sensor_data.get('level') is None and not sensor_data.get('all_data')
+    _no_rain = rain_data.get('rain_sum_3d', 0) == 0 and not rain_data.get('raw_daily')
+    if _no_sensor and _no_rain:
+        st.error(
+            "🚫 **" + ("ไม่สามารถเชื่อมต่อแหล่งข้อมูลใดได้" if st.session_state.lang == 'TH'
+            else "All data sources unavailable") + "**\n\n" +
+            ("ระบบไม่สามารถแสดงความเสี่ยงที่แม่นยำได้ กรุณาตรวจสอบประกาศจากเทศบาลนครหาดใหญ่โดยตรง"
+            if st.session_state.lang == 'TH'
+            else "System cannot display accurate risk. Please check Hatyai Municipality announcements directly.")
+        )
+    
     risk_report = predictor.analyze_flood_risk(sensor_data, rain_data)
     
     latest_df = predictor.get_latest_data(hours=24)
     roc = predictor.calculate_rate_of_change()
     preds = predictor.predict_next_hours(3)
     
+    # QA/QC flags
+    qa_result = compute_qa_flags(sensor_data, roc, sensor_data.get('timestamp'))
+    
     # Timezone handling with proper Bangkok time
     last_update = sensor_data.get("timestamp") or get_bangkok_time()
     last_update_str = last_update.strftime('%d/%m/%Y %H:%M')
 
-    # === HEADER ===
-    st.markdown(f"# {t['title']}")
-    # Clean up data source display (remove ID)
+    # === HEADER — Centered Title (matching user's mockup) ===
     source_display = risk_report['data_source']
-    st.caption(f"{t['subtitle']} — {t['last_update']}: {last_update_str} | {t['source']}: {source_display}")
+    _logo = icon_b64('logo.png')
+    # Logo size 2.5x via CSS class
+    _logo_img = f'<img src="{_logo}" class="hero-logo-massive">' if _logo else ''
+    _header_html = (
+        '<div style="position:relative;text-align:center;margin-bottom:20px;padding-bottom:12px;border-bottom:4px solid #60a5fa;">'
+        '<div style="position:absolute;top:0;right:0;text-align:right;font-size:0.82rem;color:#64748b;line-height:1.7;">'
+        f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:5px;animation:pulse-dot 2s ease-in-out infinite;"></span> <b style="color:#1a1a2e;">LIVE</b><br>'
+        f'{t["last_update"]}: <b style="color:#1a1a2e;">{last_update_str}</b><br>'
+        f'{t["source"]}: {source_display}'
+        '</div>'
+        '<div style="display:inline-flex;align-items:center;gap:30px;justify-content:center;">'
+        f'{_logo_img}'
+        '<div style="text-align:left;">'
+        # Title 2.5x larger (104px), Subtitle 2x larger (35px) via CSS classes
+        f'<div class="hero-title-massive">{t["title"]}</div>'
+        f'<div class="hero-subtitle-massive">{t["subtitle"]}</div>'
+        '</div></div></div>'
+    )
+    st.markdown(_header_html, unsafe_allow_html=True)
+
+    # === ABOUT MODAL MENU BUTTON ===
+    bt1, bt2, bt3 = st.columns([1, 2, 1])
+    with bt2:
+        btn_label = "ℹ️ เกี่ยวกับระบบนี้" if lang_key == 'th' else "ℹ️ About This System"
+        if st.button(btn_label, use_container_width=True):
+            show_about_dialog(lang_key)
+
+
+    # === DISCLAIMER — right under title ===
+    _disc = t.get('disclaimer', '')
+    if _disc:
+        st.markdown(
+            f'<div style="background:#fefce8;border:1px solid #fde047;border-radius:10px;padding:12px 18px;margin-bottom:16px;font-size:0.82rem;color:#854d0e;line-height:1.7;">{_disc}</div>',
+            unsafe_allow_html=True
+        )
 
     if sensor_data['is_fallback']:
         st.warning(f"⚠️ Sensor data unavailable. Using **{source_display}** ({risk_report['confidence_score']}%)")
     
+    # --- QA STATUS STRIP ---
+    render_qa_strip(qa_result, lang_key)
+    
+    # QA badges inline (compact)
+    render_inline_qa_badges(qa_result)
+
+    # --- ACTION BANNER (always visible, risk-appropriate) ---
+    risk_pct = risk_report.get('primary_risk', 0)
+
     # --- ZOMBIE DATA WARNING ---
-    if zombie_report:
-        for station, info in zombie_report.items():
-            if station == '_scraper':
-                continue
-            zombie_val = info.get('zombie_value', '?')
-            reason = info.get('reason', 'Unknown')
-            if st.session_state.lang == "TH":
-                st.error(
-                    f"🧟 **ตรวจพบข้อมูลผี (Zombie Data)** — สถานี **{station}** "
-                    f"ส่งค่า **{zombie_val}m** แต่เซนเซอร์มีปัญหา: _{reason}_\n\n"
-                    f"→ ระบบ **ละเว้นค่านี้** และใช้ข้อมูลสำรองแทน"
-                )
-            else:
-                st.error(
-                    f"🧟 **Zombie Data Detected** — Station **{station}** "
-                    f"reported **{zombie_val}m** but sensor has issues: _{reason}_\n\n"
-                    f"→ System **ignoring this value** and using fallback data."
-                )
+    render_zombie_warning(zombie_report, lang_key)
 
     # ==========================================================
     # SECTION 1: HERO — Risk Gauge + ETA + Situation Report
     # ==========================================================
-    # Layout: Left (Gauge) wider : Right (Situation) narrower
-    col_left, col_right = st.columns([4, 3], gap="large")
-
-    # Localization Helper for this section
-    lang_key = "th" if st.session_state.lang == "TH" else "en"
-    
-    with col_left:
-        # 1. Gauge
-        fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=risk_report['primary_risk'],
-            number={'suffix': "%", 'font': {'size': 48, 'color': risk_report['color'], 'family': 'Inter'}},
-            domain={'x': [0, 1], 'y': [0, 1]},
-            gauge={
-                'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': '#CBD5E1'},
-                'bar': {'color': risk_report['color'], 'thickness': 0.2},
-                'bgcolor': '#F8FAFC',
-                'borderwidth': 0,
-                'steps': [
-                    {'range': [0, 30], 'color': '#DCFCE7'},
-                    {'range': [30, 70], 'color': '#FEF9C3'},
-                    {'range': [70, 100], 'color': '#FEE2E2'}
-                ],
-                'threshold': {
-                    'line': {'color': risk_report['color'], 'width': 4},
-                    'thickness': 0.8,
-                    'value': risk_report['primary_risk']
-                }
-            }
-        ))
-        fig_gauge.update_layout(
-            height=220, margin=dict(l=20, r=20, t=10, b=10),
-            paper_bgcolor='rgba(0,0,0,0)', font={'color': '#1e293b'}
-        )
-        st.plotly_chart(fig_gauge, use_container_width=True)
-
-        # 2. Alert Badge
-        alert_color = risk_report['color']
-        main_msg = risk_report.get(f"main_message_{lang_key}", risk_report['main_message_en'])
-        
-        st.markdown(
-            f"<div style='background:{alert_color};padding:8px 12px;border-radius:8px;margin-bottom:12px;"
-            f"color:white;font-weight:700;text-align:center;font-size:1rem;box-shadow: 0 2px 4px rgba(0,0,0,0.1);'>"
-            f"{main_msg}</div>",
-            unsafe_allow_html=True
-        )
-
-        # 3. ETA Card (Context-aware: don't show travel time during normal conditions)
-        eta = risk_report.get('eta', {})
-        eta_hours = eta.get('eta_hours', 0)
-        sadao_rising = eta.get('sadao_rising', False)
-        bank_ratio = eta.get('bank_full_ratio', 0)
-        
-        # Only show ETA hours when it's meaningful (upstream is rising or >70% bank)
-        vel = eta.get('velocity_ms', 0)
-        if sadao_rising or bank_ratio > 0.7:
-            bg_eta = "#fee2e2" if eta_hours < 6 else "#eff6ff"
-            eta_display = eta.get('eta_label', '--')
-            velocity_display = f"{t['eta_speed']}: <b>{vel} m/s</b>"
-        else:
-            bg_eta = "#f0fdf4"  # green-ish = safe
-            if lang_key == 'th':
-                eta_display = "ปกติ"
-                velocity_display = f"กระแสน้ำ: <b>{vel} m/s</b>"
-            else:
-                eta_display = "Normal"
-                velocity_display = f"Flow: <b>{vel} m/s</b>"
-        
-        st.markdown(
-            f"""
-            <div style="background:{bg_eta};padding:12px;border-radius:10px;border:1px solid #dae1e7;text-align:center;margin-top:8px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;">
-                    <span style="color:#64748b;font-size:0.85rem;font-weight:600;">\u23f1\ufe0f {t['eta_title']}</span>
-                    <span style="color:#1e293b;font-size:1.1rem;font-weight:800;">{eta_display}</span>
-                </div>
-                <div style="font-size:0.75rem;color:#64748b;text-align:right;margin-top:2px;">
-                    {velocity_display}
-                </div>
-            </div>
-            """, 
-            unsafe_allow_html=True
-        )
-
-    with col_right:
-        # 4. Situation Report (New Component)
-        summary = risk_report.get('summary_report', {})
-        
-        if not summary:
-            st.info("🔄 Processing AI Summary...")
-        else:
-            # Data Preparation
-            head = summary.get(f"headline_{lang_key}", "N/A")
-            rain = summary.get(f"rain_context_{lang_key}", "N/A")
-            upstream = summary.get(f"upstream_{lang_key}", "N/A")
-            action = summary.get(f"action_{lang_key}", "N/A")
-            
-            title_txt = "📝 สรุปสถานการณ์น้ำภาพรวม" if lang_key == "th" else "📝 Situation Report"
-            border_c = risk_report['color']
-            
-            st.markdown(
-                f"""
-                <div style="background:white;border-radius:12px;border:1px solid #e2e8f0;border-left:8px solid {border_c};padding:24px;height:100%;box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
-                    <h3 style="margin-top:0;font-size:1.25rem;font-weight:700;color:#1e293b;border-bottom:1px solid #f1f5f9;padding-bottom:12px;margin-bottom:16px;">
-                        {title_txt}
-                    </h3>
-                    <div style="font-size:1.15rem;font-weight:700;color:{border_c};margin-bottom:20px;line-height:1.5;">
-                        {head}
-                    </div>
-                    <ul style="list-style-type:none;padding:0;font-size:1.05rem;color:#334155;line-height:1.8;">
-                        <li style="margin-bottom:12px;display:flex;align-items:start;">
-                            <span style="margin-right:8px;">🌧️</span> <span>{rain}</span>
-                        </li>
-                        <li style="margin-bottom:8px;display:flex;align-items:start;">
-                            <span style="margin-right:8px;">🌊</span> <span>{upstream}</span>
-                        </li>
-                        <li style="margin-bottom:0px;display:flex;align-items:start;background:#f8fafc;padding:8px;border-radius:6px;">
-                            <span style="margin-right:8px;">⚡</span> <span style="font-weight:600;color:#0f172a;">{action}</span>
-                        </li>
-                    </ul>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-        
-    st.markdown("---")
+    render_hero(risk_report, lang_key, t)
 
     # ==========================================================
     # EMERGENCY RESPONSE SECTION (Critical Mode)
@@ -527,15 +294,15 @@ def main():
         st.markdown("### 🆘 EMERGENCY RESPONSE ACTIVATED")
         
         # Emergency alert banner
-        st.markdown(
-            f"""
-            <div style="background:linear-gradient(135deg, #ff5252, #ff1744);color:white;padding:20px;border-radius:12px;margin-bottom:20px;text-align:center;box-shadow:0 4px 20px rgba(255,23,68,0.3);">
-                <h2 style="margin:0;color:white;font-size:1.8rem;">🚨 CRITICAL FLOOD WARNING 🚨</h2>
-                <p style="margin:10px 0 0 0;font-size:1.1rem;opacity:0.9;">Immediate action required. Risk Level: {risk_report['primary_risk']}%</p>
-            </div>
-            """, 
-            unsafe_allow_html=True
+        _emerg_html = (
+            '<div class="fade-in" style="background:linear-gradient(135deg,#ef4444,#b91c1c);'
+            'color:white;padding:24px;border-radius:16px;margin-bottom:20px;text-align:center;'
+            'box-shadow:0 8px 32px rgba(239,68,68,0.25);">'
+            '<h2 style="margin:0;color:white;font-size:1.6rem;font-weight:800;letter-spacing:-0.3px;">🚨 CRITICAL FLOOD WARNING 🚨</h2>'
+            f'<p style="margin:10px 0 0 0;font-size:1rem;opacity:0.85;font-weight:500;">Immediate action required. Risk Level: {risk_report["primary_risk"]}%</p>'
+            '</div>'
         )
+        st.markdown(_emerg_html, unsafe_allow_html=True)
         
         # Emergency contacts and evacuation info
         col_emergency, col_evacuation = st.columns(2, gap="large")
@@ -554,9 +321,9 @@ def main():
             for service, number in emergency_info:
                 st.markdown(
                     f"""
-                    <div style="background:white;border:1px solid #e2e8f0;border-left:4px solid #ff5252;padding:12px;border-radius:8px;margin-bottom:8px;">
-                        <div style="font-weight:600;color:#1e293b;">{service}</div>
-                        <div style="font-size:1.2rem;color:#ff5252;font-weight:700;">{number}</div>
+                    <div class="emergency-card">
+                        <div style="font-weight:600;color:#0f172a;font-size:0.9rem;">{service}</div>
+                        <div style="font-size:1.2rem;color:#ef4444;font-weight:800;letter-spacing:-0.3px;">{number}</div>
                     </div>
                     """, 
                     unsafe_allow_html=True
@@ -600,7 +367,11 @@ def main():
     # ==========================================================
     # SECTION 1.5: CHECKLIST (Full Width)
     # ==========================================================
-    st.markdown(f"#### 📋 {t['checklist_title']}")
+    st.markdown('<div style="margin-top: 32px;"></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="fade-in"><span class="section-header">📋 {t["checklist_title"]}</span></div>',
+        unsafe_allow_html=True
+    )
     
     # Localization logic for Checklist
     checklist_items = risk_report.get(f"action_checklist_{lang_key}", risk_report['action_checklist_en'])
@@ -614,92 +385,14 @@ def main():
     # ==========================================================
     # SECTION 2: STATION PIPELINE
     # ==========================================================
-    st.markdown(f"### 🔗 {t['pipeline_title']}")
-    
-    all_data = sensor_data.get("all_data", {})
-    bank_info = sensor_data.get("bank_info", {})
-    sadao_v = clean_value(all_data.get("Sadao"))
-    hatyai_v = clean_value(all_data.get("HatYai"))
-    kalla_v = clean_value(all_data.get("Kallayanamit"))
-    eta_hrs = eta.get('eta_hours', 21)
-
-    # Calculate water depth and bank margin for each station
-    # Prefer API's diff_wl_bank, fallback to calculated
-    def station_info(station_name, msl_value):
-        """Convert MSL to depth + bank distance."""
-        meta = STATION_METADATA.get(station_name, {})
-        ground = meta.get('ground_level', 0)
-        bank = meta.get('bank_full_capacity', 0)
-        api_bank = bank_info.get(station_name, {})
-        
-        if msl_value is not None:
-            depth = round(msl_value - ground, 2)
-            # Use API diff_wl_bank if available (negative = safe, positive = overtopping)
-            api_diff = api_bank.get('diff_wl_bank')
-            if api_diff is not None:
-                left_to_bank = round(abs(api_diff), 2)
-                is_overtopping = api_diff > 0
-            else:
-                left_to_bank = round(bank - msl_value, 2)
-                is_overtopping = msl_value > bank
-            return {'depth': depth, 'left_to_bank': left_to_bank, 'msl': msl_value, 'overtopping': is_overtopping}
-        return {'depth': None, 'left_to_bank': None, 'msl': None, 'overtopping': False}
-    
-    sadao_info = station_info('Sadao', sadao_v)
-    hatyai_info = station_info('HatYai', hatyai_v)
-    kalla_info = station_info('Kallayanamit', kalla_v)
-
-    p1, a1, p2, a2, p3 = st.columns([2, 0.8, 2, 0.8, 2])
-    
-    lang = st.session_state.lang
-    
-    # Helper for pipeline card — bold name, depth, "อีก X ม. จะล้นตลิ่ง"
-    def pipecard(col, name, info, color_dot, station_key):
-        with col:
-            if info['depth'] is not None:
-                val_str = f"{info['depth']:.1f}m"
-                ltb = info['left_to_bank']
-                if info['overtopping']:
-                    bank_text = f"น้ำล้นตลิ่ง {ltb:.1f}m" if lang == 'th' else f"Overtopping {ltb:.1f}m"
-                    bank_color = '#ef4444'
-                else:
-                    bank_text = f"อีก {ltb:.1f} ม. จะล้นตลิ่ง" if lang == 'th' else f"{ltb:.1f}m to bank"
-                    bank_color = '#22c55e' if ltb > 3 else ('#eab308' if ltb > 1 else '#ef4444')
-                st.markdown(
-                    f"""
-                    <div style="background:white;border:1px solid #e2e8f0;border-radius:12px;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,0.04);">
-                        <div style="font-weight:800;font-size:1.05rem;color:#0f172a;margin-bottom:4px;">
-                            {color_dot} {name}
-                        </div>
-                        <div style="font-weight:700;font-size:1.6rem;color:#1e293b;line-height:1.3;">
-                            {val_str}
-                        </div>
-                        <div style="font-size:0.78rem;color:{bank_color};font-weight:600;">
-                            {bank_text}
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-            else:
-                st.metric(label=f"{color_dot} {name}", value=t['sensor_offline'])
-
-    pipecard(p1, "Sadao", sadao_info, dot(sadao_v, 'Sadao'), 'Sadao')
-    
-    with a1:
-        st.markdown(f"<div style='text-align:center;padding-top:28px;color:#cbd5e1;font-size:2rem;font-weight:800;'>\u27a1</div>", unsafe_allow_html=True)
-
-    pipecard(p2, "Bang Sala", kalla_info, dot(kalla_v, 'Kallayanamit'), 'Kallayanamit')
-    
-    with a2:
-        st.markdown(f"<div style='text-align:center;padding-top:28px;color:#cbd5e1;font-size:2rem;font-weight:800;'>\u27a1</div>", unsafe_allow_html=True)
-
-    pipecard(p3, "Hatyai", hatyai_info, dot(hatyai_v, 'HatYai'), 'HatYai')
+    eta = risk_report.get('eta', {})
+    render_pipeline(sensor_data, eta, t, lang_key, roc)
 
     # ==========================================================
-    # SECTION 3: METRIC CARDS
+    # SECTION 3: METRIC CARDS (Overview — no duplicate station data)
     # ==========================================================
-    c1, c2, c3, c4 = st.columns(4)
+    st.markdown('<div style="margin-top: 24px;"></div>', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
 
     with c1:
         st.metric(
@@ -709,103 +402,59 @@ def main():
         )
 
     with c2:
-        val = clean_value(sensor_data.get('level'))
-        delta = roc.get(sensor_data.get('station_name'), 0)
-        
-        # Show water depth for HatYai (primary station)
-        hy_info = hatyai_info
-        if hy_info['depth'] is not None:
-            depth = hy_info['depth']
-            ltb = hy_info['left_to_bank']
-            if hy_info['overtopping']:
-                bank_text = f"น้ำล้นตลิ่ง {ltb:.1f}ม." if lang == 'th' else f"Over bank {ltb:.1f}m"
-                bank_color = '#ef4444'
-            else:
-                bank_text = f"อีก {ltb:.1f} ม. จะล้นตลิ่ง" if lang == 'th' else f"{ltb:.1f}m to bank"
-                bank_color = '#22c55e' if ltb > 3 else ('#eab308' if ltb > 1 else '#ef4444')
-        else:
-            depth = None
-            bank_text = ''
-            bank_color = '#64748b'
-        
-        # Dynamic Color Logic
-        val_color = "#1e293b"
-        if val is not None:
-            if val > CRITICAL_LEVEL: val_color = "#ef4444"
-            elif val > WARNING_LEVEL: val_color = "#eab308"
-            
-        st.markdown(
-            f"""
-            <div style="background:white;border:1px solid #e2e8f0;border-radius:12px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.04);transition:all 0.3s ease;">
-                <div style="font-weight:800;font-size:1.05rem;color:#0f172a;margin-bottom:4px;" title="{t['hatyai_unit']}">
-                    \U0001f4cd {t['hatyai_card']}
-                </div>
-                <div style="color:{val_color};font-weight:700;font-size:1.8rem;line-height:1.4;">
-                    {f'{depth:.1f}' if depth is not None else '\u2014'} <span style="font-size:1rem;color:#64748b;">m</span>
-                </div>
-                <div style="font-size:0.78rem;color:{bank_color};font-weight:600;">
-                    {bank_text}
-                </div>
-                <div style="font-size:0.85rem;color:{'#ef4444' if delta > 0 else '#22c55e'};font-weight:500;">
-                    {delta:+.2f} m/h
-                </div>
-            </div>
-            """, 
-            unsafe_allow_html=True
+        # Rate of Change for HatYai (primary monitoring station)
+        hy_roc = roc.get('HatYai', 0)
+        roc_label = "📈 อัตราเปลี่ยนแปลง" if lang_key == 'th' else "📈 Rate of Change"
+        roc_color = '#ef4444' if hy_roc > 0 else '#22c55e'
+        _roc_sub = 'หาดใหญ่ (X.44)' if lang_key == 'th' else 'HatYai Station (X.44)'
+        _roc_html = (
+            '<div class="info-card fade-in fade-in-delay-1">'
+            f'<div style="font-weight:600;font-size:0.72rem;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">{roc_label}</div>'
+            f'<div style="font-weight:800;font-size:1.8rem;color:{roc_color};line-height:1.3;letter-spacing:-0.5px;">{hy_roc:+.2f} <span style="font-size:0.85rem;color:#94a3b8;font-weight:500;">m/h</span></div>'
+            f'<div style="font-size:0.72rem;color:#94a3b8;font-weight:500;margin-top:4px;">{_roc_sub}</div>'
+            '</div>'
         )
+        # 1. Load Custom CSS
+        st.markdown(_roc_html, unsafe_allow_html=True)
 
     with c3:
-        # Show Sadao depth + bank distance
-        sa_info = sadao_info
-        if sa_info['depth'] is not None:
-            sa_depth = sa_info['depth']
-            sa_ltb = sa_info['left_to_bank']
-            if sa_info['overtopping']:
-                sa_bank_text = f"น้ำล้นตลิ่ง {sa_ltb:.1f}ม." if lang == 'th' else f"Over bank {sa_ltb:.1f}m"
-                sa_bank_color = '#ef4444'
-            else:
-                sa_bank_text = f"อีก {sa_ltb:.1f} ม. จะล้นตลิ่ง" if lang == 'th' else f"{sa_ltb:.1f}m to bank"
-                sa_bank_color = '#22c55e' if sa_ltb > 3 else ('#eab308' if sa_ltb > 1 else '#ef4444')
-            sa_val = f"{sa_depth:.1f} m"
+        # ETA — Time for flood water to reach HatYai
+        eta_hours = eta.get('eta_hours', 0)
+        eta_label_key = eta.get('eta_label', '--')
+        eta_title = "⏱️ เวลาน้ำถึง" if lang_key == 'th' else "⏱️ ETA to HatYai"
+        sadao_rising = eta.get('sadao_rising', False)
+        if sadao_rising or eta.get('bank_full_ratio', 0) > 0.7:
+            eta_bg = 'linear-gradient(135deg, #fef2f2, #fee2e2)' if eta_hours < 6 else 'linear-gradient(135deg, #eff6ff, #dbeafe)'
+            eta_border = '#fecaca' if eta_hours < 6 else '#bfdbfe'
+            eta_val = eta_label_key
         else:
-            sa_val = t['sensor_offline']
-            sa_bank_text = ''
-            sa_bank_color = '#64748b'
+            eta_bg = 'linear-gradient(135deg, #f0fdf4, #dcfce7)'
+            eta_border = '#bbf7d0'
+            eta_val = 'ปกติ' if lang_key == 'th' else 'Normal'
         
-        st.markdown(
-            f"""
-            <div style="background:white;border:1px solid #e2e8f0;border-radius:12px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.04);">
-                <div style="font-weight:800;font-size:1.05rem;color:#0f172a;margin-bottom:4px;">
-                    \U0001f53c {t['sadao_card']}
-                </div>
-                <div style="font-weight:700;font-size:1.8rem;color:#1e293b;line-height:1.4;">
-                    {sa_val}
-                </div>
-                <div style="font-size:0.78rem;color:{sa_bank_color};font-weight:600;">
-                    {sa_bank_text}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True
+        _eta_sub = 'จาก อ.สะเดา → หาดใหญ่' if lang_key == 'th' else 'Sadao → HatYai'
+        _eta_html = (
+            f'<div class="fade-in fade-in-delay-2" style="background:{eta_bg};border:1px solid {eta_border};border-radius:14px;padding:16px 20px;transition:all 0.25s cubic-bezier(.4,0,.2,1);">'
+            f'<div style="font-weight:600;font-size:0.72rem;color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">{eta_title}</div>'
+            f'<div style="font-weight:800;font-size:1.8rem;color:#0f172a;line-height:1.3;letter-spacing:-0.5px;">{eta_val}</div>'
+            f'<div style="font-size:0.72rem;color:#94a3b8;font-weight:500;margin-top:4px;">{_eta_sub}</div>'
+            '</div>'
         )
-
-    with c4:
-        pred_val = f"{preds[-1]['level']:.2f} m" if preds else t['processing']
-        # Fixed: standard font size via standard metric, but ensured label is translated
-        st.metric(
-            label=f"🔮 {t['forecast_card']}",
-            value=pred_val,
-            help=t['forecast_unit']
-        )
+        st.markdown(_eta_html, unsafe_allow_html=True)
 
     # ==========================================================
-    # SECTION 4: OUTLOOK + HISTORY
+    # SECTION 4: OUTLOOK & RAIN RADAR
     # ==========================================================
-    col_out, col_hist = st.columns(2)
+    st.markdown('<div style="margin-top: 32px;"></div>', unsafe_allow_html=True)
+    
+    col_out, col_map = st.columns(2)
     
     outlook = risk_report.get('outlook', {})
     with col_out:
-        st.markdown(f"#### 📅 {t['outlook_title']}")
+        st.markdown(
+            f'<div class="fade-in"><span class="section-header">📅 {t["outlook_title"]}</span></div>',
+            unsafe_allow_html=True
+        )
         
         # Localized Trend
         trend_val = outlook.get(f'trend_{lang_key}', outlook.get('trend', 'N/A'))
@@ -842,42 +491,92 @@ def main():
             )
             st.plotly_chart(fig_daily, use_container_width=True)
     
-    with col_hist:
-        history = risk_report.get('history', {})
-        st.markdown(f"#### 📚 {t['history_title']}")
-        st.markdown(history.get('message', 'No data.'))
-        
-        from models.flood_predictor import HISTORICAL_EVENTS
-        current_rain = risk_report.get('rain_sum', 0)
-        
-        # Build comparison dataframe for Plotly
-        years = []
-        rains = []
-        colors = []
-        for year, evt in sorted(HISTORICAL_EVENTS.items()):
-            years.append(str(year))
-            rains.append(evt['rain_mm_3d'])
-            # Color logic: Red for 2010, Blue for NOW
-            if year == 2010: colors.append('#ef4444') # 2010 High Risk
-            else: colors.append('#cbd5e1')
-            
-        years.append('NOW')
-        rains.append(current_rain)
-        colors.append('#22c55e') # Green for NOW (safe) or dynamic based on risk? Let's use Green for distinctness
-        
-        fig_hist = go.Figure(data=[
-            go.Bar(x=years, y=rains, marker_color=colors,
-                   text=[f"{v:.0f}" for v in rains], textposition='auto',
-                   textfont=dict(size=11))
-        ])
-        fig_hist.update_layout(
-            height=200, margin=dict(l=0,r=0,t=5,b=5),
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            xaxis=dict(showgrid=False),
-            yaxis=dict(showgrid=True, gridcolor='#e2e8f0', title="mm")
+    with col_map:
+        st.markdown(
+            f'<div class="fade-in"><span class="section-header">📡 เรดาร์กลุ่มฝน (Rain Radar)</span></div>',
+            unsafe_allow_html=True
         )
-        st.plotly_chart(fig_hist, use_container_width=True)
+        
+        @st.cache_data(ttl=600)
+        def fetch_rainviewer_data():
+            try:
+                resp = requests.get("https://api.rainviewer.com/public/weather-maps.json", timeout=5)
+                if resp.status_code == 200:
+                    return resp.json()
+            except Exception:
+                pass
+            return None
+        
+        rv_data = fetch_rainviewer_data()
+        
+        if rv_data and 'radar' in rv_data and 'past' in rv_data['radar']:
+            # Combine past and nowcast frames
+            frames = rv_data['radar'].get('past', []) + rv_data['radar'].get('nowcast', [])
+            if frames:
+                # Build dict for slider: formatted time string -> timestamp details
+                import pytz
+                bkk_tz = pytz.timezone('Asia/Bangkok')
+                
+                frame_options = {}
+                for f in frames:
+                    ts = f['time']
+                    dt = datetime.fromtimestamp(ts, tz=bkk_tz)
+                    label = dt.strftime("%H:%M")
+                    frame_options[label] = f
+                
+                labels = list(frame_options.keys())
+                
+                # Default to the 'now' frame or the last past frame
+                default_idx = len(rv_data['radar'].get('past', [])) - 1
+                if default_idx < 0: default_idx = len(labels) - 1
+                default_label = labels[default_idx] if labels else None
+                
+                selected_label = st.select_slider(
+                    "📅 เลือกเวลา (เวลาไทย):",
+                    options=labels,
+                    value=default_label
+                )
+                
+                selected_frame = frame_options[selected_label]
+                path = selected_frame['path'] # e.g. /v2/radar/1614777000
+                
+                # Create Folium Map
+                # Center on Songkhla (Lat: 7.0048, Lon: 100.4730)
+                m = folium.Map(location=[7.0048, 100.4730], zoom_start=9, max_zoom=18)
+                
+                # Add RainViewer TileLayer
+                tile_url = f"https://tilecache.rainviewer.com{path}/256/{{z}}/{{x}}/{{y}}/2/1_1.png"
+                folium.TileLayer(
+                    tiles=tile_url,
+                    attr="RainViewer",
+                    name="Rain Radar",
+                    overlay=True,
+                    control=True,
+                    opacity=0.7,
+                    max_native_zoom=13,
+                    maxNativeZoom=13,
+                    max_zoom=18,
+                    maxZoom=18
+                ).add_to(m)
+                
+                folium.LayerControl().add_to(m)
+                
+                # Render using streamlit_folium
+                st_folium(m, height=450, use_container_width=True, returned_objects=[])
+                
+                # Radar Color Legend
+                st.markdown("""
+                <div style="display: flex; justify-content: center; gap: 15px; font-size: 14px; margin-top: 10px;">
+                    <div style="display: flex; align-items: center; gap: 5px;"><span style="width: 15px; height: 15px; background-color: #87CEFA; border-radius: 3px; display: inline-block;"></span> ฝนเล็กน้อย</div>
+                    <div style="display: flex; align-items: center; gap: 5px;"><span style="width: 15px; height: 15px; background-color: #32CD32; border-radius: 3px; display: inline-block;"></span> ฝนปานกลาง</div>
+                    <div style="display: flex; align-items: center; gap: 5px;"><span style="width: 15px; height: 15px; background-color: #FFD700; border-radius: 3px; display: inline-block;"></span> ฝนตกหนัก</div>
+                    <div style="display: flex; align-items: center; gap: 5px;"><span style="width: 15px; height: 15px; background-color: #FF4500; border-radius: 3px; display: inline-block;"></span> ฝนรุนแรง</div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.warning("ไม่พบข้อมูลเรดาร์ (No radar frames available)")
+        else:
+            st.error("ไม่สามารถโหลดข้อมูล RainViewer ได้ (Failed to fetch radar data)")
 
     # ==========================================================
     # SECTION 5: CHARTS
@@ -887,7 +586,10 @@ def main():
     hourly_rain = rain_data.get("hourly_rain", [])
     hourly_times = rain_data.get("hourly_times", [])
     if hourly_rain and hourly_times:
-        st.markdown(f"### 🌧️ {t['chart_rain_hourly']}")
+        st.markdown(
+            f'<div class="fade-in"><span class="section-header">🌧️ {t["chart_rain_hourly"]}</span></div>',
+            unsafe_allow_html=True
+        )
         colors = []
         for v in hourly_rain:
             if v > 30: colors.append("#ef4444")
@@ -917,7 +619,10 @@ def main():
 
     # 5B — WATER LEVEL TREND (24h)
     if not latest_df.empty:
-        st.markdown(f"### 📈 {t['chart_water']}")
+        st.markdown(
+            f'<div class="fade-in"><span class="section-header">📈 {t["chart_water"]}</span></div>',
+            unsafe_allow_html=True
+        )
         fig_water = go.Figure()
         
         plot_df = latest_df[latest_df['level'] > -5.0]
@@ -943,17 +648,7 @@ def main():
             marker=dict(size=5)
         ))
         
-        # Forecast line
-        val = clean_value(sensor_data.get('level'))
-        if preds and val is not None:
-            p_times = [last_update] + [p['time'] for p in preds]
-            p_levels = [val] + [p['level'] for p in preds]
-            fig_water.add_trace(go.Scatter(
-                x=p_times, y=p_levels,
-                name='Forecast', mode='lines+markers',
-                line=dict(color='#ec4899', width=2, dash='dash'),
-                marker=dict(size=5, symbol='diamond')
-            ))
+        # Forecast line removed as requested
 
         # Threshold lines
         fig_water.add_hline(y=WARNING_LEVEL, line_dash="solid", line_color="#eab308", line_width=1,
@@ -977,7 +672,10 @@ def main():
     st.markdown("---")
     
     section_title = "🌐 ข่าวสารและสถานะจากศูนย์หาดใหญ่" if st.session_state.lang == "TH" else "🌐 Local Intelligence (HatyaiCityClimate)"
-    st.markdown(f"### {section_title}")
+    st.markdown(
+        f'<div class="fade-in"><span class="section-header">{section_title}</span></div>',
+        unsafe_allow_html=True
+    )
     
     if not local_intel.get('success'):
         err = local_intel.get('error', 'Unknown')
@@ -994,15 +692,13 @@ def main():
                 for i, news in enumerate(news_items[:5]):
                     is_alert = news.get('is_alert', False)
                     icon = "🚨" if is_alert else "📰"
-                    border_color = "#ef4444" if is_alert else "#3b82f6"
+                    border_color = "#ef4444" if is_alert else "#2563eb"
                     
                     st.markdown(
                         f"""
                         <a href="{news['link']}" target="_blank" style="text-decoration:none;">
-                            <div style="background:white;border:1px solid #e2e8f0;border-left:4px solid {border_color};
-                                        border-radius:8px;padding:12px 16px;margin-bottom:8px;
-                                        transition:all 0.2s ease;cursor:pointer;">
-                                <span style="color:#1e293b;font-size:0.95rem;">
+                            <div class="news-item" style="border-left:4px solid {border_color};">
+                                <span style="color:#0f172a;font-size:0.9rem;font-weight:500;">
                                     {icon} {news['title']}
                                 </span>
                             </div>
@@ -1031,17 +727,18 @@ def main():
                 
                 detail = local_intel.get('outage_details', {}).get(station, '')
                 
+                health_bg = 'offline' if status != 'online' else 'online'
                 st.markdown(
                     f"""
-                    <div style="background:white;border:1px solid #e2e8f0;border-radius:8px;
-                                padding:10px 14px;margin-bottom:6px;display:flex;
-                                justify-content:space-between;align-items:center;">
-                        <span style="font-weight:600;color:#1e293b;">{icon} {station}</span>
-                        <span style="color:{color};font-weight:700;font-size:0.85rem;
-                                     background:{'#fee2e2' if status != 'online' else '#dcfce7'};
-                                     padding:2px 10px;border-radius:20px;">
-                            {label}
-                        </span>
+                    <div class="info-card" style="
+                        padding:10px 16px;
+                        margin-bottom:6px;
+                        display:flex;
+                        justify-content:space-between;
+                        align-items:center;
+                    ">
+                        <span style="font-weight:600;color:#0f172a;font-size:0.9rem;">{icon} {station}</span>
+                        <span class="health-badge {health_bg}">{label}</span>
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -1065,11 +762,55 @@ def main():
         )
 
     # ==========================================================
-    # FOOTER
+    # DATA PROVENANCE & SENSOR METADATA (Transparency)
     # ==========================================================
     st.markdown("---")
-    with st.expander(t["about_title"]):
-        st.markdown(t["about_text"])
+    
+    prov_col, meta_col = st.columns(2)
+    
+    with prov_col:
+        with st.expander("📊 แหล่งข้อมูล (Data Provenance)", expanded=False):
+            prov = read_provenance()
+            if prov:
+                for src, info in prov.items():
+                    status_icon = "🟢" if info.get('status') == 'ok' else ('🔵' if info.get('status') == 'cached' else '🔴')
+                    st.markdown(
+                        f"**{status_icon} {src.upper()}**\n"
+                        f"- Endpoint: `{info.get('endpoint', '?')}`\n"
+                        f"- Station IDs: `{info.get('station_ids', [])}`\n"
+                        f"- Fetched: `{info.get('fetched_utc', '?')}` UTC\n"
+                        f"- Status: `{info.get('status', '?')}`\n"
+                        f"- Fingerprint: `{info.get('fingerprint', '-')}`"
+                    )
+            else:
+                st.info("ยังไม่มีข้อมูล provenance — จะปรากฏหลังดึงข้อมูลครั้งแรก")
+    
+    with meta_col:
+        with st.expander("🔧 ข้อมูลเซ็นเซอร์ (Sensor Metadata)", expanded=False):
+            meta_rows = []
+            for name, meta in STATION_METADATA.items():
+                meta_rows.append({
+                    "Station": name,
+                    "ID": meta.get('id'),
+                    "Lat": meta.get('lat'),
+                    "Lon": meta.get('lon'),
+                    "Datum": "MSL",
+                    "Ground (m)": meta.get('ground_level'),
+                    "Bank (m)": meta.get('bank_full_capacity'),
+                    "Warning (m)": meta.get('warning_threshold'),
+                    "Critical (m)": meta.get('critical_threshold'),
+                })
+            import pandas as _pd
+            st.dataframe(_pd.DataFrame(meta_rows), use_container_width=True, hide_index=True)
+            st.caption(
+                "Datum: ทุกค่าอ้างอิง MSL (Mean Sea Level) จาก ThaiWater API\n\n"
+                "Bank = min_bank (ระดับตลิ่งต่ำสุด), Warning = bank − 1.5m"
+            )
+
+    # ==========================================================
+    # FOOTER
+    # ==========================================================
+    render_footer(t, lang_key)
 
 if __name__ == "__main__":
     main()
