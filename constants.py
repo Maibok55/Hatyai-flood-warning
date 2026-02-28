@@ -172,12 +172,12 @@ EVACUATION_ZONES = {
 API_CONFIG = {
     "thaiwater": {
         "url": "https://api-v3.thaiwater.net/api/v1/thaiwater30/public/waterlevel_load",
-        "timeout": 5,
+        "timeout": 15,
         "cache_minutes": 15
     },
     "openmeteo": {
         "url": "https://api.open-meteo.com/v1/forecast",
-        "timeout": 3,
+        "timeout": 10,
         "cache_minutes": 60
     }
 }
