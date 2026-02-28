@@ -8,3 +8,4 @@ numpy
 pytz
 folium
 streamlit-folium
+models.ingest
